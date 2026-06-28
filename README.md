@@ -40,6 +40,16 @@ The `lifetime-yield` aggregate columns `gross_gain_usd`, `loss_usd`, and `net_yi
 
 Rows changed by an incident adjustment are marked in `reports.csv` with `is_adjusted`, `incident_id`, `incident_classification`, `incident_description`, and `incident_disclosure_url`. Raw indexed `strategy_reports` rows in SQLite are not modified.
 
+### Redis Headline
+
+After a completed `lifetime-yield` analysis run, publish the odometer headline payload with:
+
+```bash
+REDIS_URL='rediss://...' yearn-data publish lifetime-yield --ttl 259200
+```
+
+The publisher atomically replaces `lifetime_yield:headline` with one JSON blob containing `net_yield_usd`, `as_of_ms`, `rate_usd_per_sec`, previous anchor fields, and `run_id`. Use `--dry-run` to print the payload without touching Redis.
+
 ## Vault Volume Outputs
 
 The `vault-volume` job indexes user `Deposit`/`Withdraw` events and strategy debt movement. V2 strategy allocation volume is derived from `StrategyReported.debtAdded` and `debtPaid`; V3 allocation volume is indexed from `DebtUpdated` events.

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from .analysis import run_lifetime_yield, run_vault_volume
 from .config import CHAINS, load_environment, normalize_chain_key
 from .discovery import discover
 from .exports import export_analysis
+from .headline import LIFETIME_YIELD_HEADLINE_KEY, publish_lifetime_yield_headline
 from .indexing import index_all_reports, index_all_volume
 from .pricing import price_unpriced_reports, price_unpriced_volume
 from .storage import DEFAULT_DB_PATH, connect, init_db, seed_chains
@@ -82,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
     export_p.add_argument("job", choices=["lifetime-yield", "vault-volume"])
     export_p.add_argument("--out", default="exports")
 
+    publish_p = sub.add_parser("publish")
+    publish_sub = publish_p.add_subparsers(dest="publish_job", required=True)
+    headline_p = publish_sub.add_parser("lifetime-yield")
+    headline_p.add_argument("--redis-url", help="Redis URL. Defaults to REDIS_URL from the environment")
+    headline_p.add_argument("--key", default=LIFETIME_YIELD_HEADLINE_KEY)
+    headline_p.add_argument("--ttl", type=int, help="Optional Redis EX TTL in seconds")
+    headline_p.add_argument("--analysis-run-id", type=int, help="Specific completed lifetime-yield analysis run to publish")
+    headline_p.add_argument("--run-id", help="Override payload run_id")
+    headline_p.add_argument("--dry-run", action="store_true", help="Print the JSON payload without writing Redis")
+
     run_p = sub.add_parser("run")
     run_p.add_argument("job", choices=["lifetime-yield", "vault-volume"])
     run_p.add_argument("--chains", nargs="+", help="Chains to discover/index")
@@ -153,6 +165,21 @@ def main(argv: list[str] | None = None) -> int:
         for path in paths:
             print(path)
         return 0
+
+    if args.command == "publish":
+        if args.publish_job == "lifetime-yield":
+            _, payload_json = publish_lifetime_yield_headline(
+                conn,
+                redis_url=args.redis_url or os.environ.get("REDIS_URL"),
+                key=args.key,
+                ttl=args.ttl,
+                analysis_run_id=args.analysis_run_id,
+                run_id=args.run_id,
+                dry_run=args.dry_run,
+            )
+            print(payload_json)
+            return 0
+        raise AssertionError(args.publish_job)
 
     if args.command == "run":
         chains = _chains(args.chains)

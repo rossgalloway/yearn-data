@@ -10,6 +10,8 @@ src/yearn_data/contracts.py
 src/yearn_data/discovery.py
 src/yearn_data/events.py
 src/yearn_data/exports.py
+src/yearn_data/headline.py
+src/yearn_data/incident_adjustments.py
 src/yearn_data/indexing.py
 src/yearn_data/multicall.py
 src/yearn_data/pricing.py
@@ -22,5 +24,7 @@ src/yearn_data.egg-info/requires.txt
 src/yearn_data.egg-info/top_level.txt
 tests/test_analysis.py
 tests/test_events.py
+tests/test_headline.py
+tests/test_indexing.py
 tests/test_pricing.py
 tests/test_storage.py

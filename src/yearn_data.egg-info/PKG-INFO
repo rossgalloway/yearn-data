@@ -4,6 +4,7 @@ Version: 0.1.0
 Summary: Reusable Yearn vault data indexing and analysis toolkit
 Requires-Python: >=3.10
 Requires-Dist: python-dotenv>=0.16.0
+Requires-Dist: redis>=5.0.0
 Requires-Dist: requests>=2.28.0
 Requires-Dist: web3<8.0.0,>=7.0.0
 Provides-Extra: dev
