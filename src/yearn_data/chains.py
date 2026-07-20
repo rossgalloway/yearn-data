@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any
 
+import requests
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
@@ -35,6 +36,39 @@ def latest_block(chain: str) -> int:
 def block_timestamp(chain: str, block_number: int) -> int:
     block: dict[str, Any] = web3_for(chain).eth.get_block(block_number)
     return int(block["timestamp"])
+
+
+def block_timestamps_batch(chain: str, block_numbers: list[int], batch_size: int = 100) -> dict[int, int]:
+    cfg = chain_config(chain)
+    url = get_rpc_url(cfg.key)
+    out: dict[int, int] = {}
+    request_id = 1
+    for i in range(0, len(block_numbers), batch_size):
+        chunk = block_numbers[i : i + batch_size]
+        id_to_block: dict[int, int] = {}
+        payload = []
+        for block_number in chunk:
+            id_to_block[request_id] = block_number
+            payload.append(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "eth_getBlockByNumber",
+                    "params": [hex(int(block_number)), False],
+                }
+            )
+            request_id += 1
+        response = requests.post(url, json=payload, timeout=RPC_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        body = response.json()
+        if isinstance(body, dict):
+            body = [body]
+        for item in body:
+            block_number = id_to_block.get(int(item.get("id", 0)))
+            result = item.get("result")
+            if block_number is not None and result and result.get("timestamp"):
+                out[block_number] = int(result["timestamp"], 16)
+    return out
 
 
 def cached_block_timestamp(conn, chain: str, block_number: int) -> int:
@@ -80,21 +114,27 @@ def cached_block_timestamps_many(conn, chain: str, block_numbers: list[int], max
     if not missing:
         return found
 
-    fetched: dict[int, int] = {}
-    workers = max(1, min(int(max_workers), len(missing)))
-    executor = ThreadPoolExecutor(max_workers=workers)
-    futures = {executor.submit(block_timestamp, chain, block_number): block_number for block_number in missing}
     try:
-        for future in as_completed(futures):
-            block_number = futures[future]
-            fetched[block_number] = int(future.result())
-    except BaseException:
-        for future in futures:
-            future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
-    else:
-        executor.shutdown(wait=True)
+        fetched = block_timestamps_batch(chain, missing)
+    except Exception:
+        fetched = {}
+
+    still_missing = [block_number for block_number in missing if block_number not in fetched]
+    if still_missing:
+        workers = max(1, min(int(max_workers), len(still_missing)))
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = {executor.submit(block_timestamp, chain, block_number): block_number for block_number in still_missing}
+        try:
+            for future in as_completed(futures):
+                block_number = futures[future]
+                fetched[block_number] = int(future.result())
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
     conn.executemany(
         """

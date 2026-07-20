@@ -9,7 +9,7 @@ from typing import Any
 
 from .incident_adjustments import adjustment_for_tx
 from .pricing import report_amount
-from .storage import to_json
+from .storage import from_json, to_json
 
 
 def _usd(raw_value: str, decimals: int | None, price: float | None) -> Decimal | None:
@@ -48,6 +48,14 @@ def _decimal_or_none(value: Decimal | None) -> str | None:
     return format(value, "f")
 
 
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        value = row[key]
+    except (KeyError, IndexError):
+        return default
+    return default if value is None else value
+
+
 def run_lifetime_yield(conn) -> int:
     run_id = create_analysis_run(conn, "lifetime-yield")
     rows = conn.execute(
@@ -56,6 +64,8 @@ def run_lifetime_yield(conn) -> int:
             r.*,
             v.asset_symbol,
             v.name AS vault_name,
+            v.management,
+            v.protocol,
             p.price_usd,
             p.status AS price_status
         FROM strategy_reports r
@@ -98,6 +108,8 @@ def run_lifetime_yield(conn) -> int:
             "version": row["version"],
             "vault_address": row["vault_address"],
             "vault_name": row["vault_name"],
+            "management": row["management"] or "yearn",
+            "protocol": row["protocol"],
             "strategy_address": row["strategy_address"],
             "tx_hash": row["tx_hash"],
             "log_index": row["log_index"],
@@ -132,16 +144,21 @@ def run_lifetime_yield(conn) -> int:
             "yield_by_chain": ("chain", str(row["chain_id"])),
             "yield_by_vault": ("vault", f"{row['chain_id']}:{row['vault_address']}"),
             "yield_by_strategy": ("strategy", f"{row['chain_id']}:{row['strategy_address']}"),
+            "yield_by_management": ("management", row["management"] or "yearn"),
         }
+        if row["protocol"]:
+            dimensions["yield_by_protocol"] = ("protocol", row["protocol"])
         for output_name, key in dimensions.items():
             bucket = totals.setdefault(
                 (output_name, key[1]),
                 {
                     "dimension": key[0],
                     "key": key[1],
-                    "chain_id": row["chain_id"] if key[0] != "all" else None,
+                    "chain_id": row["chain_id"] if key[0] in {"chain", "vault", "strategy"} else None,
                     "vault_address": row["vault_address"] if key[0] == "vault" else None,
                     "strategy_address": row["strategy_address"] if key[0] == "strategy" else None,
+                    "management": row["management"] if key[0] in {"management", "protocol", "vault", "strategy"} else None,
+                    "protocol": row["protocol"] if key[0] == "protocol" else None,
                     "reports": 0,
                     "priced_reports": 0,
                     "unpriced_reports": 0,
@@ -185,6 +202,259 @@ def run_lifetime_yield(conn) -> int:
     return run_id
 
 
+def _selected_report_price_join(table_alias: str) -> str:
+    return f"""
+        LEFT JOIN prices p
+          ON p.chain_id = {table_alias}.chain_id
+         AND p.token_address = {table_alias}.asset
+         AND p.timestamp = {table_alias}.block_timestamp
+         AND p.source = (
+            SELECT p2.source
+            FROM prices p2
+            WHERE p2.chain_id = {table_alias}.chain_id
+              AND p2.token_address = {table_alias}.asset
+              AND p2.timestamp = {table_alias}.block_timestamp
+              AND p2.status = 'ok'
+            ORDER BY CASE p2.source WHEN 'defillama' THEN 0 WHEN 'yprice' THEN 1 ELSE 2 END
+            LIMIT 1
+         )
+    """
+
+
+def _empty_fee_bucket(dimension: str, key: str, row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "dimension": dimension,
+        "key": key,
+        "chain_id": row["chain_id"] if dimension in {"chain", "vault", "strategy", "recipient"} else None,
+        "version": row["version"] if dimension in {"version", "vault", "strategy", "recipient"} else None,
+        "vault_address": row["vault_address"] if dimension == "vault" else None,
+        "strategy_address": row["strategy_address"] if dimension == "strategy" else None,
+        "recipient": row["recipient"] if dimension == "recipient" else None,
+        "management": row["management"] if dimension in {"management", "protocol", "vault", "strategy", "recipient"} else None,
+        "protocol": row["protocol"] if dimension == "protocol" else None,
+        "events": 0,
+        "priced_events": 0,
+        "unpriced_events": 0,
+        "v2_fee_mint_raw": Decimal(0),
+        "v2_fee_mint_usd": Decimal(0),
+        "v3_protocol_fees_raw": Decimal(0),
+        "v3_protocol_fees_usd": Decimal(0),
+        "v3_total_fees_raw": Decimal(0),
+        "v3_total_fees_usd": Decimal(0),
+        "v3_total_refunds_raw": Decimal(0),
+        "v3_total_refunds_usd": Decimal(0),
+        "total_fees_usd": Decimal(0),
+    }
+
+
+def _fee_dimensions(row: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    dimensions = {
+        "fee_summary": ("all", "all"),
+        "fees_by_chain": ("chain", str(row["chain_id"])),
+        "fees_by_version": ("version", row["version"]),
+        "fees_by_vault": ("vault", f"{row['chain_id']}:{row['vault_address']}"),
+        "fees_by_management": ("management", row["management"] or "yearn"),
+    }
+    if _row_get(row, "protocol"):
+        dimensions["fees_by_protocol"] = ("protocol", row["protocol"])
+    if _row_get(row, "strategy_address"):
+        dimensions["fees_by_strategy"] = ("strategy", f"{row['chain_id']}:{row['strategy_address']}")
+    if _row_get(row, "recipient"):
+        dimensions["fees_by_recipient"] = ("recipient", f"{row['chain_id']}:{row['recipient']}")
+    return dimensions
+
+
+def _add_fee_to_totals(totals: dict[tuple[str, str], dict[str, Any]], row: dict[str, Any]) -> None:
+    for output_name, key in _fee_dimensions(row).items():
+        bucket = totals.setdefault((output_name, key[1]), _empty_fee_bucket(key[0], key[1], row))
+        bucket["events"] += 1
+        if row["priced"]:
+            bucket["priced_events"] += 1
+        else:
+            bucket["unpriced_events"] += 1
+        for field in (
+            "v2_fee_mint_raw",
+            "v2_fee_mint_usd",
+            "v3_protocol_fees_raw",
+            "v3_protocol_fees_usd",
+            "v3_total_fees_raw",
+            "v3_total_fees_usd",
+            "v3_total_refunds_raw",
+            "v3_total_refunds_usd",
+            "total_fees_usd",
+        ):
+            bucket[field] += row[field] or Decimal(0)
+
+
+def _fee_row_output(row: dict[str, Any]) -> dict[str, Any]:
+    output = dict(row)
+    output.pop("priced")
+    for key in (
+        "v2_fee_mint_raw",
+        "v2_fee_mint_usd",
+        "v3_protocol_fees_raw",
+        "v3_protocol_fees_usd",
+        "v3_total_fees_raw",
+        "v3_total_fees_usd",
+        "v3_total_refunds_raw",
+        "v3_total_refunds_usd",
+        "total_fees_usd",
+    ):
+        output[key] = _decimal_or_none(output[key])
+    return output
+
+
+def _write_fee_totals(conn, run_id: int, totals: dict[tuple[str, str], dict[str, Any]]) -> None:
+    for (output_name, _), row in totals.items():
+        serialized = dict(row)
+        for key in (
+            "v2_fee_mint_raw",
+            "v2_fee_mint_usd",
+            "v3_protocol_fees_raw",
+            "v3_protocol_fees_usd",
+            "v3_total_fees_raw",
+            "v3_total_fees_usd",
+            "v3_total_refunds_raw",
+            "v3_total_refunds_usd",
+            "total_fees_usd",
+        ):
+            serialized[key] = _decimal_or_none(serialized[key])
+        write_output(conn, run_id, output_name, serialized)
+
+
+def run_vault_fees(conn) -> int:
+    """Analyze fees charged during report/harvest transactions.
+
+    V3 exposes fee amounts directly on StrategyReported. V2 does not emit fee
+    fields on StrategyReported, so V2 fees are inferred from vault share mints
+    in the same transaction as a V2 StrategyReported event.
+    """
+
+    run_id = create_analysis_run(conn, "vault-fees")
+    totals: dict[tuple[str, str], dict[str, Any]] = {}
+
+    v3_rows = conn.execute(
+        f"""
+        SELECT
+            r.*,
+            v.asset_symbol,
+            v.name AS vault_name,
+            v.management,
+            v.protocol,
+            p.price_usd,
+            p.status AS price_status
+        FROM strategy_reports r
+        LEFT JOIN vaults v
+          ON v.chain_id = r.chain_id AND v.address = r.vault_address
+        {_selected_report_price_join("r")}
+        WHERE r.version='v3'
+          AND (
+            CAST(COALESCE(r.protocol_fees_raw, '0') AS INTEGER) > 0
+            OR CAST(COALESCE(r.total_fees_raw, '0') AS INTEGER) > 0
+            OR CAST(COALESCE(r.total_refunds_raw, '0') AS INTEGER) > 0
+          )
+        ORDER BY r.chain_id, r.block_number, r.log_index
+        """
+    ).fetchall()
+    for row in v3_rows:
+        protocol_raw = Decimal(int(row["protocol_fees_raw"] or 0))
+        total_raw = Decimal(int(row["total_fees_raw"] or 0))
+        refunds_raw = Decimal(int(row["total_refunds_raw"] or 0))
+        protocol_usd = _usd(str(int(protocol_raw)), row["asset_decimals"], row["price_usd"])
+        total_usd = _usd(str(int(total_raw)), row["asset_decimals"], row["price_usd"])
+        refunds_usd = _usd(str(int(refunds_raw)), row["asset_decimals"], row["price_usd"])
+        output = {
+            "source": "v3_strategy_report",
+            "chain_id": row["chain_id"],
+            "version": "v3",
+            "vault_address": row["vault_address"],
+            "vault_name": row["vault_name"],
+            "management": row["management"] or "yearn",
+            "protocol": row["protocol"],
+            "strategy_address": row["strategy_address"],
+            "recipient": None,
+            "tx_hash": row["tx_hash"],
+            "log_index": row["log_index"],
+            "block_number": row["block_number"],
+            "block_timestamp": row["block_timestamp"],
+            "asset": row["asset"],
+            "asset_symbol": row["asset_symbol"],
+            "price_usd": row["price_usd"],
+            "price_status": row["price_status"] or "missing",
+            "priced": total_usd is not None,
+            "v2_fee_mint_raw": Decimal(0),
+            "v2_fee_mint_usd": Decimal(0),
+            "v3_protocol_fees_raw": protocol_raw,
+            "v3_protocol_fees_usd": protocol_usd,
+            "v3_total_fees_raw": total_raw,
+            "v3_total_fees_usd": total_usd,
+            "v3_total_refunds_raw": refunds_raw,
+            "v3_total_refunds_usd": refunds_usd,
+            "total_fees_usd": total_usd,
+        }
+        write_output(conn, run_id, "fee_events", _fee_row_output(output))
+        _add_fee_to_totals(totals, output)
+
+    v2_rows = conn.execute(
+        f"""
+        SELECT
+            fe.*,
+            v.asset_symbol,
+            v.name AS vault_name,
+            v.management,
+            v.protocol,
+            p.price_usd,
+            p.status AS price_status
+        FROM vault_fee_events fe
+        LEFT JOIN vaults v
+          ON v.chain_id = fe.chain_id AND v.address = fe.vault_address
+        {_selected_report_price_join("fe")}
+        WHERE fe.version='v2'
+          AND CAST(fe.fee_raw AS INTEGER) > 0
+        ORDER BY fe.chain_id, fe.block_number, fe.log_index
+        """
+    ).fetchall()
+    for row in v2_rows:
+        fee_raw = Decimal(int(row["fee_raw"]))
+        fee_usd = _usd(row["fee_raw"], row["asset_decimals"], row["price_usd"])
+        output = {
+            "source": row["source"],
+            "chain_id": row["chain_id"],
+            "version": "v2",
+            "vault_address": row["vault_address"],
+            "vault_name": row["vault_name"],
+            "management": row["management"] or "yearn",
+            "protocol": row["protocol"],
+            "strategy_address": row["strategy_address"],
+            "recipient": row["recipient"],
+            "tx_hash": row["tx_hash"],
+            "log_index": row["log_index"],
+            "block_number": row["block_number"],
+            "block_timestamp": row["block_timestamp"],
+            "asset": row["asset"],
+            "asset_symbol": row["asset_symbol"],
+            "price_usd": row["price_usd"],
+            "price_status": row["price_status"] or "missing",
+            "priced": fee_usd is not None,
+            "v2_fee_mint_raw": fee_raw,
+            "v2_fee_mint_usd": fee_usd,
+            "v3_protocol_fees_raw": Decimal(0),
+            "v3_protocol_fees_usd": Decimal(0),
+            "v3_total_fees_raw": Decimal(0),
+            "v3_total_fees_usd": Decimal(0),
+            "v3_total_refunds_raw": Decimal(0),
+            "v3_total_refunds_usd": Decimal(0),
+            "total_fees_usd": fee_usd,
+        }
+        write_output(conn, run_id, "fee_events", _fee_row_output(output))
+        _add_fee_to_totals(totals, output)
+
+    _write_fee_totals(conn, run_id, totals)
+    conn.commit()
+    complete_analysis_run(conn, run_id)
+    return run_id
+
+
 def _selected_price_join(table_alias: str) -> str:
     return f"""
         LEFT JOIN prices p
@@ -204,12 +474,14 @@ def _empty_volume_bucket(dimension: str, key: str, row: Any) -> dict[str, Any]:
     return {
         "dimension": dimension,
         "key": key,
-        "chain_id": row["chain_id"] if dimension != "all" else None,
+        "chain_id": row["chain_id"] if dimension in {"chain", "vault", "strategy", "token"} else None,
         "version": row["version"] if dimension in {"version", "vault", "strategy"} else None,
         "vault_address": row["vault_address"] if dimension == "vault" else None,
         "strategy_address": row["strategy_address"] if dimension == "strategy" else None,
         "asset": row["asset"] if dimension == "token" else None,
         "asset_symbol": row["asset_symbol"] if dimension == "token" else None,
+        "management": row["management"] if dimension in {"management", "protocol", "vault", "strategy", "token"} else None,
+        "protocol": row["protocol"] if dimension == "protocol" else None,
         "month": key if dimension == "month" else None,
         "events": 0,
         "priced_events": 0,
@@ -233,7 +505,10 @@ def _volume_dimensions(row: Any) -> dict[str, tuple[str, str]]:
         "volume_by_vault": ("vault", f"{row['chain_id']}:{row['vault_address']}"),
         "volume_by_token": ("token", f"{row['chain_id']}:{row['asset']}"),
         "volume_by_month": ("month", _month(row["block_timestamp"])),
+        "volume_by_management": ("management", row["management"] or "yearn"),
     }
+    if _row_get(row, "protocol"):
+        dimensions["volume_by_protocol"] = ("protocol", row["protocol"])
     if row["strategy_address"]:
         dimensions["volume_by_strategy"] = ("strategy", f"{row['chain_id']}:{row['strategy_address']}")
     return dimensions
@@ -282,6 +557,8 @@ def run_vault_volume(conn) -> int:
             NULL AS strategy_address,
             v.asset_symbol,
             v.name AS vault_name,
+            v.management,
+            v.protocol,
             p.price_usd,
             p.status AS price_status
         FROM vault_flows vf
@@ -298,6 +575,8 @@ def run_vault_volume(conn) -> int:
             "version": row["version"],
             "vault_address": row["vault_address"],
             "vault_name": row["vault_name"],
+            "management": row["management"] or "yearn",
+            "protocol": row["protocol"],
             "direction": row["direction"],
             "sender": row["sender"],
             "owner": row["owner"],
@@ -323,6 +602,8 @@ def run_vault_volume(conn) -> int:
             sdf.*,
             v.asset_symbol,
             v.name AS vault_name,
+            v.management,
+            v.protocol,
             p.price_usd,
             p.status AS price_status
         FROM strategy_debt_flows sdf
@@ -339,6 +620,8 @@ def run_vault_volume(conn) -> int:
             "version": row["version"],
             "vault_address": row["vault_address"],
             "vault_name": row["vault_name"],
+            "management": row["management"] or "yearn",
+            "protocol": row["protocol"],
             "strategy_address": row["strategy_address"],
             "direction": row["direction"],
             "source_event": row["source_event"],

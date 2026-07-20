@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from yearn_data.analysis import run_lifetime_yield, run_vault_volume
+from yearn_data.analysis import run_lifetime_yield, run_vault_fees, run_vault_volume
 from yearn_data.config import CHAINS
 from yearn_data.storage import connect, from_json, init_db, seed_chains
 
@@ -201,3 +201,123 @@ def test_vault_volume_sums_user_and_strategy_gross_flows(tmp_path):
     assert Decimal(output["gross_user_volume_usd"]) == Decimal("2.500")
     assert Decimal(output["gross_strategy_volume_usd"]) == Decimal("1.250")
     assert Decimal(output["gross_total_volume_usd"]) == Decimal("3.750")
+
+
+def test_vault_fees_uses_v3_report_fee_fields(tmp_path):
+    conn = connect(tmp_path / "test.sqlite")
+    init_db(conn)
+    seed_chains(conn, CHAINS)
+    conn.execute(
+        """
+        INSERT INTO vaults (
+            chain_id, version, address, asset, asset_symbol, asset_decimals,
+            updated_at
+        )
+        VALUES (1, 'v3', '0x0000000000000000000000000000000000000001',
+                '0x0000000000000000000000000000000000000002', 'USDC', 6, 1)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO strategy_reports (
+            chain_id, version, vault_address, strategy_address, tx_hash, log_index,
+            block_number, block_timestamp, asset, asset_decimals, gain_raw, loss_raw,
+            net_raw, current_debt_raw, protocol_fees_raw, total_fees_raw,
+            total_refunds_raw, extra_json
+        )
+        VALUES (1, 'v3', '0x0000000000000000000000000000000000000001',
+                '0x0000000000000000000000000000000000000003',
+                '0xabc', 0, 10, 100, '0x0000000000000000000000000000000000000002',
+                6, '10000000', '0', '10000000', '0', '1000000', '2500000',
+                '500000', '{}')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO prices (chain_id, token_address, timestamp, source, price_usd, status)
+        VALUES (1, '0x0000000000000000000000000000000000000002', 100, 'defillama', 2.0, 'ok')
+        """
+    )
+    conn.commit()
+
+    run_id = run_vault_fees(conn)
+    row = conn.execute(
+        "SELECT row_json FROM analysis_outputs WHERE run_id=? AND name='fee_summary'",
+        (run_id,),
+    ).fetchone()
+    output = from_json(row["row_json"])
+    assert output["events"] == 1
+    assert Decimal(output["v3_protocol_fees_usd"]) == Decimal("2.00")
+    assert Decimal(output["v3_total_fees_usd"]) == Decimal("5.00")
+    assert Decimal(output["v3_total_refunds_usd"]) == Decimal("1.00")
+    assert Decimal(output["total_fees_usd"]) == Decimal("5.00")
+
+
+def test_vault_fees_infers_v2_same_tx_share_mints(tmp_path):
+    conn = connect(tmp_path / "test.sqlite")
+    init_db(conn)
+    seed_chains(conn, CHAINS)
+    conn.execute(
+        """
+        INSERT INTO vaults (
+            chain_id, version, address, asset, asset_symbol, asset_decimals,
+            updated_at
+        )
+        VALUES (1, 'v2', '0x0000000000000000000000000000000000000001',
+                '0x0000000000000000000000000000000000000002', 'DAI', 18, 1)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO strategy_reports (
+            chain_id, version, vault_address, strategy_address, tx_hash, log_index,
+            block_number, block_timestamp, asset, asset_decimals, gain_raw, loss_raw,
+            net_raw, extra_json
+        )
+        VALUES (1, 'v2', '0x0000000000000000000000000000000000000001',
+                '0x0000000000000000000000000000000000000003',
+                '0xabc', 5, 10, 100, '0x0000000000000000000000000000000000000002',
+                18, '10000000000000000000', '0', '10000000000000000000', '{}')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO vault_fee_events (
+            chain_id, version, source, vault_address, strategy_address, recipient,
+            tx_hash, log_index, block_number, block_timestamp, asset,
+            asset_decimals, fee_raw, shares_raw, decoded_json
+        )
+        VALUES (1, 'v2', 'v2_harvest_share_mint',
+                '0x0000000000000000000000000000000000000001',
+                '0x0000000000000000000000000000000000000003',
+                '0x0000000000000000000000000000000000000004',
+                '0xabc', 6, 10, 100, '0x0000000000000000000000000000000000000002',
+                18, '3000000000000000000', '3000000000000000000',
+                '{"from":"0x0000000000000000000000000000000000000000","to":"0x0000000000000000000000000000000000000004","source_event":"Transfer"}')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO prices (chain_id, token_address, timestamp, source, price_usd, status)
+        VALUES (1, '0x0000000000000000000000000000000000000002', 100, 'defillama', 1.5, 'ok')
+        """
+    )
+    conn.commit()
+
+    run_id = run_vault_fees(conn)
+    row = conn.execute(
+        "SELECT row_json FROM analysis_outputs WHERE run_id=? AND name='fee_summary'",
+        (run_id,),
+    ).fetchone()
+    output = from_json(row["row_json"])
+    assert output["events"] == 1
+    assert Decimal(output["v2_fee_mint_usd"]) == Decimal("4.50")
+    assert Decimal(output["total_fees_usd"]) == Decimal("4.50")
+
+    event_row = conn.execute(
+        "SELECT row_json FROM analysis_outputs WHERE run_id=? AND name='fee_events'",
+        (run_id,),
+    ).fetchone()
+    event = from_json(event_row["row_json"])
+    assert event["source"] == "v2_harvest_share_mint"
+    assert event["recipient"] == "0x0000000000000000000000000000000000000004"

@@ -34,6 +34,16 @@ ROLE_MANAGER_ABI = [
     }
 ]
 
+V3_VAULT_FACTORY_NEW_VAULT_EVENT = {
+    "anonymous": False,
+    "type": "event",
+    "name": "NewVault",
+    "inputs": [
+        {"indexed": True, "type": "address", "name": "vault_address"},
+        {"indexed": True, "type": "address", "name": "asset"},
+    ],
+}
+
 V2_REGISTRY_ABI = [
     {
         "anonymous": False,

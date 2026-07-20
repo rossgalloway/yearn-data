@@ -6,12 +6,12 @@ import argparse
 import os
 from pathlib import Path
 
-from .analysis import run_lifetime_yield, run_vault_volume
+from .analysis import run_lifetime_yield, run_vault_fees, run_vault_volume
 from .config import CHAINS, load_environment, normalize_chain_key
 from .discovery import discover
 from .exports import export_analysis
 from .headline import LIFETIME_YIELD_HEADLINE_KEY, publish_lifetime_yield_headline
-from .indexing import index_all_reports, index_all_volume
+from .indexing import index_all_reports, index_all_volume, index_v2_fee_mints_from_reports
 from .pricing import price_unpriced_reports, price_unpriced_volume
 from .storage import DEFAULT_DB_PATH, connect, init_db, seed_chains
 
@@ -31,6 +31,8 @@ def _run_analysis(conn, job: str) -> int:
         return run_lifetime_yield(conn)
     if job == "vault-volume":
         return run_vault_volume(conn)
+    if job == "vault-fees":
+        return run_vault_fees(conn)
     raise ValueError(f"unsupported analysis job {job!r}")
 
 
@@ -56,32 +58,53 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Find deployment blocks now. Slower, but reduces later scan ranges.",
     )
+    discover_p.add_argument(
+        "--include-non-yearn",
+        action="store_true",
+        help="Also discover public V3 VaultFactory vaults not managed by Yearn role managers.",
+    )
+    discover_p.add_argument(
+        "--skip-v2",
+        action="store_true",
+        help="Skip Ethereum V2 registry discovery when refreshing V3-only vault sets.",
+    )
 
     index_p = sub.add_parser("index-events")
     index_p.add_argument("--chains", nargs="+", help="Chains to index")
+    index_p.add_argument("--versions", nargs="+", choices=["v2", "v3"], help="Vault versions to index")
     index_p.add_argument("--to-block", type=int, help="Stop block for every selected chain")
     index_p.add_argument("--chunk-size", type=int, default=50_000)
 
     volume_index_p = sub.add_parser("index-volume")
     volume_index_p.add_argument("--chains", nargs="+", help="Chains to index")
+    volume_index_p.add_argument("--versions", nargs="+", choices=["v2", "v3"], help="Vault versions to index")
     volume_index_p.add_argument("--to-block", type=int, help="Stop block for every selected chain")
     volume_index_p.add_argument("--chunk-size", type=int, default=50_000)
+
+    fee_index_p = sub.add_parser("index-fees")
+    fee_index_p.add_argument("--chains", nargs="+", help="Chains to index")
 
     price_p = sub.add_parser("price")
     price_p.add_argument("--limit", type=int, help="Maximum distinct token/timestamp prices to fetch")
     price_p.add_argument("--source", choices=["yprice", "defillama"], default="defillama")
     price_p.add_argument("--fallback", choices=["yprice", "defillama", "none"], default="yprice")
+    price_p.add_argument("--retry-missing", action="store_true", help="Retry existing non-ok price rows")
+    price_p.add_argument("--chains", nargs="+", help="Restrict report pricing to chains")
+    price_p.add_argument("--no-onchain-fallbacks", action="store_true", help="Use only the selected offchain price source")
 
     volume_price_p = sub.add_parser("price-volume")
     volume_price_p.add_argument("--limit", type=int, help="Maximum distinct token/timestamp prices to fetch")
     volume_price_p.add_argument("--source", choices=["yprice", "defillama"], default="defillama")
     volume_price_p.add_argument("--fallback", choices=["yprice", "defillama", "none"], default="yprice")
+    volume_price_p.add_argument("--retry-missing", action="store_true", help="Retry existing non-ok price rows")
+    volume_price_p.add_argument("--chains", nargs="+", help="Restrict volume pricing to chains")
+    volume_price_p.add_argument("--no-onchain-fallbacks", action="store_true", help="Use only the selected offchain price source")
 
     analyze_p = sub.add_parser("analyze")
-    analyze_p.add_argument("job", choices=["lifetime-yield", "vault-volume"])
+    analyze_p.add_argument("job", choices=["lifetime-yield", "vault-volume", "vault-fees"])
 
     export_p = sub.add_parser("export")
-    export_p.add_argument("job", choices=["lifetime-yield", "vault-volume"])
+    export_p.add_argument("job", choices=["lifetime-yield", "vault-volume", "vault-fees"])
     export_p.add_argument("--out", default="exports")
 
     publish_p = sub.add_parser("publish")
@@ -117,7 +140,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "discover":
-        count = discover(conn, _chains(args.chains), find_deployment=args.find_deployment)
+        count = discover(
+            conn,
+            _chains(args.chains),
+            find_deployment=args.find_deployment,
+            include_non_yearn=args.include_non_yearn,
+            skip_v2=args.skip_v2,
+        )
         print(f"discovered/upserted {count} vault rows")
         return 0
 
@@ -125,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         count = index_all_reports(
             conn,
             _chains(args.chains),
+            versions=args.versions,
             to_block=args.to_block,
             chunk_size=args.chunk_size,
             progress=progress,
@@ -136,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         count = index_all_volume(
             conn,
             _chains(args.chains),
+            versions=args.versions,
             to_block=args.to_block,
             chunk_size=args.chunk_size,
             progress=progress,
@@ -143,15 +174,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"indexed {count} volume logs/rows")
         return 0
 
+    if args.command == "index-fees":
+        count = index_v2_fee_mints_from_reports(conn, _chains(args.chains), progress=progress)
+        print(f"indexed {count} fee events")
+        return 0
+
     if args.command == "price":
         fallback = None if args.fallback == "none" else args.fallback
-        count = price_unpriced_reports(conn, limit=args.limit, source=args.source, fallback=fallback)
+        chain_ids = {CHAINS[chain].chain_id for chain in _chains(args.chains)} if args.chains else None
+        count = price_unpriced_reports(
+            conn,
+            limit=args.limit,
+            source=args.source,
+            fallback=fallback,
+            retry_missing=args.retry_missing,
+            chain_ids=chain_ids,
+            onchain_fallbacks=not args.no_onchain_fallbacks,
+        )
         print(f"priced/recorded {count} token timestamp rows")
         return 0
 
     if args.command == "price-volume":
         fallback = None if args.fallback == "none" else args.fallback
-        count = price_unpriced_volume(conn, limit=args.limit, source=args.source, fallback=fallback)
+        chain_ids = {CHAINS[chain].chain_id for chain in _chains(args.chains)} if args.chains else None
+        count = price_unpriced_volume(
+            conn,
+            limit=args.limit,
+            source=args.source,
+            fallback=fallback,
+            retry_missing=args.retry_missing,
+            chain_ids=chain_ids,
+            onchain_fallbacks=not args.no_onchain_fallbacks,
+        )
         print(f"priced/recorded {count} volume token timestamp rows")
         return 0
 

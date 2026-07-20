@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS vaults (
     asset_decimals INTEGER,
     name TEXT,
     api_version TEXT,
+    management TEXT NOT NULL DEFAULT 'yearn',
+    protocol TEXT,
     deployment_block INTEGER,
     active INTEGER NOT NULL DEFAULT 1,
     updated_at INTEGER NOT NULL,
@@ -151,6 +153,34 @@ ON strategy_debt_flows (chain_id, asset, block_timestamp);
 CREATE INDEX IF NOT EXISTS strategy_debt_flows_strategy_idx
 ON strategy_debt_flows (chain_id, strategy_address, block_number);
 
+CREATE TABLE IF NOT EXISTS vault_fee_events (
+    chain_id INTEGER NOT NULL,
+    version TEXT NOT NULL,
+    source TEXT NOT NULL,
+    vault_address TEXT NOT NULL,
+    strategy_address TEXT,
+    recipient TEXT,
+    tx_hash TEXT NOT NULL,
+    log_index INTEGER NOT NULL,
+    block_number INTEGER NOT NULL,
+    block_timestamp INTEGER NOT NULL,
+    asset TEXT,
+    asset_decimals INTEGER,
+    fee_raw TEXT NOT NULL,
+    shares_raw TEXT,
+    protocol_fees_raw TEXT,
+    total_fees_raw TEXT,
+    total_refunds_raw TEXT,
+    decoded_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (chain_id, tx_hash, log_index, source)
+);
+
+CREATE INDEX IF NOT EXISTS vault_fee_events_asset_idx
+ON vault_fee_events (chain_id, asset, block_timestamp);
+
+CREATE INDEX IF NOT EXISTS vault_fee_events_vault_idx
+ON vault_fee_events (chain_id, vault_address, block_number);
+
 CREATE TABLE IF NOT EXISTS prices (
     chain_id INTEGER NOT NULL,
     token_address TEXT NOT NULL,
@@ -208,7 +238,15 @@ def connect(path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _ensure_column(conn, "vaults", "management", "TEXT NOT NULL DEFAULT 'yearn'")
+    _ensure_column(conn, "vaults", "protocol", "TEXT")
     conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def seed_chains(conn: sqlite3.Connection, chains: dict[str, Any]) -> None:

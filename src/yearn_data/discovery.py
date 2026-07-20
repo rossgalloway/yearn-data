@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from hexbytes import HexBytes
 import requests
 from web3 import Web3
 
-from .abis import ROLE_MANAGER_ABI, V2_REGISTRY_ABI
+from .abis import ROLE_MANAGER_ABI, V2_REGISTRY_ABI, V3_VAULT_FACTORY_NEW_VAULT_EVENT
 from .chains import find_contract_creation_block, latest_block, web3_for
 from .config import CHAINS, V2_ETH_REGISTRIES, V3_ROLE_MANAGERS, get_etherscan_api_key
 from .contracts import checksum, contract, vault_metadata, vault_metadata_many
@@ -29,6 +29,8 @@ class VaultRecord:
     name: str | None
     api_version: str | None
     deployment_block: int | None
+    management: str = "yearn"
+    protocol: str | None = None
 
 
 def discover_v3_vault_addresses(chain: str) -> list[str]:
@@ -38,6 +40,111 @@ def discover_v3_vault_addresses(chain: str) -> list[str]:
         return []
     c = contract(chain, manager, ROLE_MANAGER_ABI)
     return [checksum(v) for v in c.functions.getAllVaults().call()]
+
+
+V3_VAULT_FACTORIES = (
+    "0x310aC28ACF5E514abDbFF9Ab25e21f1bfe22bcAC",  # 3.1.0
+    "0x770D0d1Fb036483Ed4AbB6d53c1C88fb277D812F",  # 3.0.4
+    "0x5577EdcB8A856582297CdBbB07055E6a6E38eb5f",  # 3.0.3
+    "0x444045c5C13C246e117eD36437303cac8E250aB0",  # 3.0.2
+    "0xE9E8C89c8Fc7E8b8F23425688eb68987231178e5",  # 3.0.1
+)
+
+V3_FACTORY_START_BLOCKS = {
+    "eth": 17_000_000,
+    "polygon": 45_000_000,
+    "base": 0,
+    "arb": 100_000_000,
+    "kat": 0,
+}
+
+V3_FACTORY_DEPLOYMENT_BLOCKS = {
+    "polygon": {
+        "0x310aC28ACF5E514abDbFF9Ab25e21f1bfe22bcAC": 88_795_322,
+        "0x770D0d1Fb036483Ed4AbB6d53c1C88fb277D812F": 63_721_181,
+        "0x5577EdcB8A856582297CdBbB07055E6a6E38eb5f": 62_228_366,
+        "0x444045c5C13C246e117eD36437303cac8E250aB0": 54_308_118,
+        "0xE9E8C89c8Fc7E8b8F23425688eb68987231178e5": 48_907_735,
+    },
+    "base": {
+        "0x310aC28ACF5E514abDbFF9Ab25e21f1bfe22bcAC": 47_554_109,
+        "0x770D0d1Fb036483Ed4AbB6d53c1C88fb277D812F": 21_802_552,
+        "0x5577EdcB8A856582297CdBbB07055E6a6E38eb5f": 20_207_449,
+        "0x444045c5C13C246e117eD36437303cac8E250aB0": 12_295_872,
+        "0xE9E8C89c8Fc7E8b8F23425688eb68987231178e5": 12_295_552,
+    },
+    "arb": {
+        "0x310aC28ACF5E514abDbFF9Ab25e21f1bfe22bcAC": 475_224_753,
+        "0x770D0d1Fb036483Ed4AbB6d53c1C88fb277D812F": 269_623_414,
+        "0x5577EdcB8A856582297CdBbB07055E6a6E38eb5f": 256_920_915,
+        "0x444045c5C13C246e117eD36437303cac8E250aB0": 187_480_878,
+        "0xE9E8C89c8Fc7E8b8F23425688eb68987231178e5": 142_038_391,
+    },
+    "kat": {
+        "0x310aC28ACF5E514abDbFF9Ab25e21f1bfe22bcAC": 35_157_654,
+        "0x770D0d1Fb036483Ed4AbB6d53c1C88fb277D812F": 2_236_950,
+    },
+}
+
+
+def discover_v3_factory_vault_addresses(chain: str, find_deployment: bool = False) -> dict[tuple[str, str], int]:
+    w3 = web3_for(chain)
+    topic = event_topic(V3_VAULT_FACTORY_NEW_VAULT_EVENT)
+    start_block = V3_FACTORY_START_BLOCKS.get(chain, 0)
+    if find_deployment:
+        starts = []
+        for factory in V3_VAULT_FACTORIES:
+            try:
+                factory_address = checksum(factory)
+                if not w3.eth.get_code(factory_address):
+                    continue
+                starts.append(find_contract_creation_block(chain, factory_address))
+            except Exception:
+                continue
+        if starts:
+            start_block = min(starts)
+    rows: dict[tuple[str, str], int] = {}
+    for factory in V3_VAULT_FACTORIES:
+        factory_address = checksum(factory)
+        try:
+            if not w3.eth.get_code(factory_address):
+                continue
+            factory_start = V3_FACTORY_DEPLOYMENT_BLOCKS.get(chain, {}).get(factory_address, start_block)
+            logs = _get_logs_chunked(
+                chain,
+                {
+                    "fromBlock": factory_start,
+                    "toBlock": latest_block(chain),
+                    "address": factory_address,
+                    "topics": [topic],
+                },
+                chunk_size=1_000_000,
+            )
+        except Exception:
+            continue
+        for log in logs:
+            _, args = decode_event(chain, [V3_VAULT_FACTORY_NEW_VAULT_EVENT], log)
+            vault = args.get("vault_address")
+            if not vault:
+                continue
+            key = (factory_address, checksum(vault))
+            rows[key] = min(int(log["blockNumber"]), rows.get(key, int(log["blockNumber"])))
+    return rows
+
+
+def classify_non_yearn_protocol(record: VaultRecord) -> str:
+    name = str(record.name or "").lower()
+    symbol = str(record.asset_symbol or "").lower()
+    text = " ".join(str(value or "").lower() for value in (record.name, record.asset_symbol, record.address, record.asset))
+    if "sturdy" in text:
+        return "sturdy-finance"
+    if "term" in text:
+        return "term-finance"
+    if symbol == "cusd" or symbol.startswith("cusd") or name.startswith("cap ") or " cap " in f" {name} ":
+        return "cap"
+    if "scrvusd" in text or "savings crvusd" in name:
+        return "curve-scrvusd"
+    return "unknown"
 
 
 def discover_v2_vault_addresses() -> list[tuple[str, str]]:
@@ -122,6 +229,8 @@ def build_vault_record(chain: str, version: str, address: str, source_address: s
         name=metadata["name"],
         api_version=metadata["api_version"],
         deployment_block=deployment_block,
+        management="yearn",
+        protocol=None,
     )
 
 
@@ -153,8 +262,46 @@ def build_vault_records(
                 name=metadata["name"],
                 api_version=metadata["api_version"],
                 deployment_block=deployment_block,
+                management="yearn",
+                protocol=None,
             )
         )
+    return records
+
+
+def discover_v3_factory_vault_records(chain: str, find_deployment: bool = False) -> list[VaultRecord]:
+    cfg = CHAINS[chain]
+    factory_vaults = discover_v3_factory_vault_addresses(chain, find_deployment=find_deployment)
+    if not factory_vaults:
+        return []
+    yearn_vaults = set(discover_v3_vault_addresses(chain))
+    records: list[VaultRecord] = []
+    by_factory: dict[str, list[tuple[str, int]]] = {}
+    for (factory, vault), deployment_block in factory_vaults.items():
+        if vault in yearn_vaults:
+            continue
+        by_factory.setdefault(factory, []).append((vault, deployment_block))
+    for factory, rows in by_factory.items():
+        addresses = [address for address, _ in rows]
+        deployment_by_address = {address: deployment_block for address, deployment_block in rows}
+        metadata_by_address = vault_metadata_many(chain, addresses)
+        for address in addresses:
+            metadata = metadata_by_address.get(address) or vault_metadata(chain, address)
+            record = VaultRecord(
+                chain_id=cfg.chain_id,
+                version="v3",
+                address=address,
+                source_address=factory,
+                asset=metadata["asset"],
+                asset_symbol=metadata["asset_symbol"],
+                asset_decimals=metadata["asset_decimals"],
+                name=metadata["name"],
+                api_version=metadata["api_version"],
+                management="non_yearn",
+                protocol=None,
+                deployment_block=deployment_by_address.get(address),
+            )
+            records.append(replace(record, protocol=classify_non_yearn_protocol(record)))
     return records
 
 
@@ -289,6 +436,8 @@ def upsert_vaults(conn, vaults: list[VaultRecord]) -> int:
             v.name,
             v.api_version,
             v.deployment_block,
+            v.management,
+            v.protocol,
             now,
         )
         for v in vaults
@@ -297,9 +446,10 @@ def upsert_vaults(conn, vaults: list[VaultRecord]) -> int:
         """
         INSERT INTO vaults (
             chain_id, version, address, source_address, asset, asset_symbol,
-            asset_decimals, name, api_version, deployment_block, updated_at
+            asset_decimals, name, api_version, deployment_block, management,
+            protocol, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chain_id, address) DO UPDATE SET
             version=excluded.version,
             source_address=excluded.source_address,
@@ -309,6 +459,8 @@ def upsert_vaults(conn, vaults: list[VaultRecord]) -> int:
             name=excluded.name,
             api_version=excluded.api_version,
             deployment_block=COALESCE(excluded.deployment_block, vaults.deployment_block),
+            management=excluded.management,
+            protocol=excluded.protocol,
             updated_at=excluded.updated_at
         """,
         rows,
@@ -317,14 +469,22 @@ def upsert_vaults(conn, vaults: list[VaultRecord]) -> int:
     return cur.rowcount
 
 
-def discover(conn, chains: list[str], find_deployment: bool = False) -> int:
+def discover(
+    conn,
+    chains: list[str],
+    find_deployment: bool = False,
+    include_non_yearn: bool = False,
+    skip_v2: bool = False,
+) -> int:
     records: list[VaultRecord] = []
     for chain in chains:
         if chain in V3_ROLE_MANAGERS_BY_KEY:
             source = V3_ROLE_MANAGERS[CHAINS[chain].chain_id]
             vaults = discover_v3_vault_addresses(chain)
             records.extend(build_vault_records(chain, "v3", vaults, source, find_deployment))
-    if "eth" in chains:
+            if include_non_yearn:
+                records.extend(discover_v3_factory_vault_records(chain, find_deployment=find_deployment))
+    if "eth" in chains and not skip_v2:
         records.extend(discover_v2_vault_records(find_deployment))
     return upsert_vaults(conn, records)
 

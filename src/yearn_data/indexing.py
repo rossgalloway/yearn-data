@@ -309,6 +309,22 @@ def insert_strategy_debt_flow(conn, row: tuple[Any, ...]) -> int:
     return int(cur.rowcount)
 
 
+def insert_vault_fee_event(conn, row: tuple[Any, ...]) -> int:
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO vault_fee_events (
+            chain_id, version, source, vault_address, strategy_address, recipient,
+            tx_hash, log_index, block_number, block_timestamp, asset,
+            asset_decimals, fee_raw, shares_raw, protocol_fees_raw,
+            total_fees_raw, total_refunds_raw, decoded_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        row,
+    )
+    return int(cur.rowcount)
+
+
 def insert_strategy_report(conn, row: tuple[Any, ...]) -> None:
     conn.execute(
         """
@@ -989,20 +1005,189 @@ def index_v2_debt_flows_from_reports(conn, chains: list[str] | None = None) -> i
     return inserted
 
 
+def _receipt_with_retry(w3, tx_hash: str, attempts: int = 5):
+    for attempt in range(attempts):
+        try:
+            return w3.eth.get_transaction_receipt(tx_hash)
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(2 ** attempt)
+
+
+def _topic_hex(topic: Any) -> str:
+    text = topic.hex() if hasattr(topic, "hex") else str(topic)
+    return text if text.startswith("0x") else f"0x{text}"
+
+
+def _address_from_topic(topic: Any) -> str:
+    text = _topic_hex(topic)
+    return Web3.to_checksum_address("0x" + text[-40:])
+
+
+def _decode_transfer_value(log: Any) -> int:
+    data = log["data"]
+    if isinstance(data, bytes):
+        raw = data
+    else:
+        text = data.hex() if hasattr(data, "hex") else str(data)
+        raw = bytes.fromhex(text[2:] if text.startswith("0x") else text)
+    return int(abi_decode(["uint256"], raw)[0])
+
+
+def index_v2_fee_mints_from_reports(
+    conn,
+    chains: list[str] | None = None,
+    progress: ProgressCallback | None = None,
+) -> int:
+    """Collect V2 harvest fee share mints from report transaction receipts."""
+
+    selected = chains or ["eth"]
+    total_inserted = 0
+    transfer_topic = erc20_transfer_topic().lower()
+    zero_topic = ZERO_TOPIC.lower()
+    chain_by_id = {cfg.chain_id: cfg.key for cfg in CHAINS.values()}
+
+    for chain in selected:
+        cfg = CHAINS[chain]
+        if cfg.key != "eth":
+            continue
+        last_done = get_index_state(conn, cfg.chain_id, "v2-fee-mints", "Transfer")
+        params: list[Any] = [cfg.chain_id]
+        block_filter = ""
+        if last_done is not None:
+            block_filter = "AND block_number > ?"
+            params.append(int(last_done))
+        report_rows = conn.execute(
+            f"""
+            SELECT
+                chain_id,
+                tx_hash,
+                vault_address,
+                MIN(strategy_address) AS strategy_address,
+                COUNT(DISTINCT strategy_address) AS strategy_count,
+                MIN(block_number) AS block_number,
+                MIN(block_timestamp) AS block_timestamp,
+                MIN(asset) AS asset,
+                MIN(asset_decimals) AS asset_decimals
+            FROM strategy_reports
+            WHERE version='v2'
+              AND chain_id=?
+              {block_filter}
+            GROUP BY chain_id, tx_hash, vault_address
+            ORDER BY block_number, tx_hash, vault_address
+            """,
+            params,
+        ).fetchall()
+        if not report_rows:
+            continue
+
+        w3 = web3_for(chain_by_id[cfg.chain_id])
+        by_vault = {
+            Web3.to_checksum_address(row["address"]): row
+            for row in conn.execute("SELECT * FROM vaults WHERE chain_id=? AND version='v2'", (cfg.chain_id,))
+        }
+        candidates: list[tuple[Any, Any, int, str, str]] = []
+        processed_block = int(report_rows[0]["block_number"])
+        for idx, row in enumerate(report_rows, start=1):
+            vault = Web3.to_checksum_address(row["vault_address"])
+            receipt = _receipt_with_retry(w3, row["tx_hash"])
+            vault_transfer_out: list[tuple[Any, int, str, str]] = []
+            fee_mint_logs: list[tuple[Any, int, str, str]] = []
+            for log in receipt["logs"]:
+                if Web3.to_checksum_address(log["address"]) != vault:
+                    continue
+                if not log["topics"] or _topic_hex(log["topics"][0]).lower() != transfer_topic:
+                    continue
+                if len(log["topics"]) < 3:
+                    continue
+                shares = _decode_transfer_value(log)
+                if shares <= 0:
+                    continue
+                from_address = _address_from_topic(log["topics"][1])
+                to_address = _address_from_topic(log["topics"][2])
+                if _topic_hex(log["topics"][1]).lower() == zero_topic and to_address == vault:
+                    fee_mint_logs.append((log, shares, to_address, "v2_harvest_fee_mint_unsplit"))
+                elif from_address == vault and to_address != Web3.to_checksum_address(ZERO_ADDRESS):
+                    vault_transfer_out.append((log, shares, to_address, "v2_harvest_fee_transfer"))
+            if fee_mint_logs:
+                if vault_transfer_out:
+                    candidates.extend((row, log, shares, recipient, source) for log, shares, recipient, source in vault_transfer_out)
+                else:
+                    candidates.extend((row, log, shares, recipient, source) for log, shares, recipient, source in fee_mint_logs)
+            processed_block = int(row["block_number"])
+            if progress and (idx == 1 or idx % 500 == 0 or idx == len(report_rows)):
+                progress(f"{chain} v2 fees: fetched {idx}/{len(report_rows)} report receipts")
+
+        pps_cache = _cached_vault_share_prices_many(
+            conn,
+            chain,
+            by_vault,
+            [{"address": log["address"], "blockNumber": int(log["blockNumber"])} for _, log, _, _, _ in candidates],
+        )
+        for row, log, shares, recipient, source in candidates:
+            vault = Web3.to_checksum_address(row["vault_address"])
+            block_number = int(log["blockNumber"])
+            price_per_share, share_decimals = pps_cache[(vault, block_number)]
+            assets = shares * int(price_per_share) // (10 ** int(share_decimals))
+            total_inserted += insert_vault_fee_event(
+                conn,
+                (
+                    cfg.chain_id,
+                    "v2",
+                    source,
+                    vault,
+                    Web3.to_checksum_address(row["strategy_address"]) if int(row["strategy_count"] or 0) == 1 else None,
+                    recipient,
+                    _hex(log["transactionHash"]),
+                    int(log["logIndex"]),
+                    block_number,
+                    int(row["block_timestamp"]),
+                    Web3.to_checksum_address(row["asset"]) if row["asset"] else None,
+                    row["asset_decimals"],
+                    str(int(assets)),
+                    str(int(shares)),
+                    None,
+                    None,
+                    None,
+                    json.dumps(
+                        {
+                            "source_event": "Transfer",
+                            "fee_source": source,
+                            "from": vault if source == "v2_harvest_fee_transfer" else ZERO_ADDRESS,
+                            "to": recipient,
+                            "value": str(int(shares)),
+                            "price_per_share_raw": str(int(price_per_share)),
+                            "share_decimals": int(share_decimals),
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        set_index_state(conn, cfg.chain_id, "v2-fee-mints", "Transfer", processed_block)
+    conn.commit()
+    return total_inserted
+
+
 def index_all_volume(
     conn,
     chains: list[str] | None = None,
+    versions: list[str] | None = None,
     to_block: int | None = None,
     chunk_size: int = 50_000,
     address_batch_size: int = 100,
     progress: ProgressCallback | None = None,
 ) -> int:
     params: list[Any] = []
-    where = ""
+    where_parts: list[str] = []
     if chains:
         chain_ids = [CHAINS[c].chain_id for c in chains]
-        where = f"WHERE chain_id IN ({','.join('?' for _ in chain_ids)})"
+        where_parts.append(f"chain_id IN ({','.join('?' for _ in chain_ids)})")
         params.extend(chain_ids)
+    if versions:
+        where_parts.append(f"version IN ({','.join('?' for _ in versions)})")
+        params.extend(versions)
+    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     rows = conn.execute(f"SELECT * FROM vaults {where} ORDER BY chain_id, version, address", params).fetchall()
     total = 0
     by_group: dict[tuple[str, str], list[Any]] = {}
@@ -1038,24 +1223,30 @@ def index_all_volume(
                     chunk_size=chunk_size,
                     progress=progress,
                 )
-    total += index_v2_debt_flows_from_reports(conn, chains=chains)
+    if not versions or "v2" in versions:
+        total += index_v2_debt_flows_from_reports(conn, chains=chains)
     return total
 
 
 def index_all_reports(
     conn,
     chains: list[str] | None = None,
+    versions: list[str] | None = None,
     to_block: int | None = None,
     chunk_size: int = 50_000,
     address_batch_size: int = 100,
     progress: ProgressCallback | None = None,
 ) -> int:
     params: list[Any] = []
-    where = ""
+    where_parts: list[str] = []
     if chains:
         chain_ids = [CHAINS[c].chain_id for c in chains]
-        where = f"WHERE chain_id IN ({','.join('?' for _ in chain_ids)})"
+        where_parts.append(f"chain_id IN ({','.join('?' for _ in chain_ids)})")
         params.extend(chain_ids)
+    if versions:
+        where_parts.append(f"version IN ({','.join('?' for _ in versions)})")
+        params.extend(versions)
+    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     rows = conn.execute(f"SELECT * FROM vaults {where} ORDER BY chain_id, version, address", params).fetchall()
     total = 0
     by_group: dict[tuple[str, str], list[Any]] = {}
