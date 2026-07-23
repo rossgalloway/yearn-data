@@ -10,8 +10,6 @@ The first analysis job is `lifetime-yield`, which backfills Yearn V2/V3 `Strateg
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
-# Optional, recommended for best historical DeFi-native pricing:
-pip install -e '.[yprice]'
 
 yearn-data init-db
 yearn-data discover
@@ -21,7 +19,18 @@ yearn-data analyze lifetime-yield
 yearn-data export lifetime-yield
 ```
 
-By default the CLI loads RPC and API values from `.env` in this repo, then `/home/bot/bots/yvusd-bots/.env`.
+By default the CLI loads RPC and API values from `.env` in this repo. Required RPC variables depend on the chains you run:
+
+```bash
+ETH_RPC_URL=
+POLYGON_RPC_URL=
+BASE_RPC_URL=
+ARB_RPC_URL=
+KAT_RPC_URL=
+ETHERSCAN_API_KEY=
+```
+
+`ETHERSCAN_API_KEY` is optional for most indexing runs, but useful for V2 source/ABI review workflows.
 
 ## Useful Options
 
@@ -62,12 +71,11 @@ The `price` command supports three modes:
 
 ```bash
 yearn-data price --source defillama
-yearn-data price --source yprice
-yearn-data price --source defillama --fallback yprice
-yearn-data price-volume --source defillama --fallback yprice
+yearn-data price-volume --source defillama
+yearn-data price --source defillama --no-onchain-fallbacks
 ```
 
-DefiLlama is the default primary source. `yprice` uses `ypricemagic` historical block pricing when that optional dependency is installed and is used as the default fallback for assets DefiLlama cannot price. All source/status rows are stored in SQLite.
+DefiLlama is the only offchain pricing source. When DefiLlama cannot price a token directly, the default pricing path can apply local deterministic fallbacks for canonical stablecoins, canonical wrapped/native equivalents, selected Curve/CRV derivative tokens, exchange-rate wrappers, and Aave aTokens. Use `--no-onchain-fallbacks` to record only direct DefiLlama results. All source/status rows are stored in SQLite.
 
 ## Backfill Efficiency
 

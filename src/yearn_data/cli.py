@@ -86,16 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     price_p = sub.add_parser("price")
     price_p.add_argument("--limit", type=int, help="Maximum distinct token/timestamp prices to fetch")
-    price_p.add_argument("--source", choices=["yprice", "defillama"], default="defillama")
-    price_p.add_argument("--fallback", choices=["yprice", "defillama", "none"], default="yprice")
+    price_p.add_argument("--source", choices=["defillama"], default="defillama")
     price_p.add_argument("--retry-missing", action="store_true", help="Retry existing non-ok price rows")
     price_p.add_argument("--chains", nargs="+", help="Restrict report pricing to chains")
     price_p.add_argument("--no-onchain-fallbacks", action="store_true", help="Use only the selected offchain price source")
 
     volume_price_p = sub.add_parser("price-volume")
     volume_price_p.add_argument("--limit", type=int, help="Maximum distinct token/timestamp prices to fetch")
-    volume_price_p.add_argument("--source", choices=["yprice", "defillama"], default="defillama")
-    volume_price_p.add_argument("--fallback", choices=["yprice", "defillama", "none"], default="yprice")
+    volume_price_p.add_argument("--source", choices=["defillama"], default="defillama")
     volume_price_p.add_argument("--retry-missing", action="store_true", help="Retry existing non-ok price rows")
     volume_price_p.add_argument("--chains", nargs="+", help="Restrict volume pricing to chains")
     volume_price_p.add_argument("--no-onchain-fallbacks", action="store_true", help="Use only the selected offchain price source")
@@ -123,8 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--to-block", type=int)
     run_p.add_argument("--chunk-size", type=int, default=50_000)
     run_p.add_argument("--price-limit", type=int)
-    run_p.add_argument("--price-source", choices=["yprice", "defillama"], default="defillama")
-    run_p.add_argument("--price-fallback", choices=["yprice", "defillama", "none"], default="yprice")
+    run_p.add_argument("--price-source", choices=["defillama"], default="defillama")
+    run_p.add_argument("--no-onchain-fallbacks", action="store_true", help="Use only the selected offchain price source")
     run_p.add_argument("--find-deployment", action="store_true")
     run_p.add_argument("--out", default="exports")
     return parser
@@ -180,13 +178,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "price":
-        fallback = None if args.fallback == "none" else args.fallback
         chain_ids = {CHAINS[chain].chain_id for chain in _chains(args.chains)} if args.chains else None
         count = price_unpriced_reports(
             conn,
             limit=args.limit,
             source=args.source,
-            fallback=fallback,
+            fallback=None,
             retry_missing=args.retry_missing,
             chain_ids=chain_ids,
             onchain_fallbacks=not args.no_onchain_fallbacks,
@@ -195,13 +192,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "price-volume":
-        fallback = None if args.fallback == "none" else args.fallback
         chain_ids = {CHAINS[chain].chain_id for chain in _chains(args.chains)} if args.chains else None
         count = price_unpriced_volume(
             conn,
             limit=args.limit,
             source=args.source,
-            fallback=fallback,
+            fallback=None,
             retry_missing=args.retry_missing,
             chain_ids=chain_ids,
             onchain_fallbacks=not args.no_onchain_fallbacks,
@@ -245,20 +241,21 @@ def main(argv: list[str] | None = None) -> int:
         else:
             count = index_all_volume(conn, chains, to_block=args.to_block, chunk_size=args.chunk_size, progress=progress)
             print(f"indexed {count} volume logs/rows")
-        fallback = None if args.price_fallback == "none" else args.price_fallback
         if args.job == "lifetime-yield":
             count = price_unpriced_reports(
                 conn,
                 limit=args.price_limit,
                 source=args.price_source,
-                fallback=fallback,
+                fallback=None,
+                onchain_fallbacks=not args.no_onchain_fallbacks,
             )
         else:
             count = price_unpriced_volume(
                 conn,
                 limit=args.price_limit,
                 source=args.price_source,
-                fallback=fallback,
+                fallback=None,
+                onchain_fallbacks=not args.no_onchain_fallbacks,
             )
         print(f"priced/recorded {count} token timestamp rows")
         run_id = _run_analysis(conn, args.job)

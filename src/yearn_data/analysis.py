@@ -82,7 +82,7 @@ def run_lifetime_yield(conn) -> int:
               AND p2.token_address = r.asset
               AND p2.timestamp = r.block_timestamp
               AND p2.status = 'ok'
-            ORDER BY CASE p2.source WHEN 'defillama' THEN 0 WHEN 'yprice' THEN 1 ELSE 2 END
+            ORDER BY CASE p2.source WHEN 'defillama' THEN 0 ELSE 1 END
             LIMIT 1
          )
         """
@@ -215,7 +215,7 @@ def _selected_report_price_join(table_alias: str) -> str:
               AND p2.token_address = {table_alias}.asset
               AND p2.timestamp = {table_alias}.block_timestamp
               AND p2.status = 'ok'
-            ORDER BY CASE p2.source WHEN 'defillama' THEN 0 WHEN 'yprice' THEN 1 ELSE 2 END
+            ORDER BY CASE p2.source WHEN 'defillama' THEN 0 ELSE 1 END
             LIMIT 1
          )
     """

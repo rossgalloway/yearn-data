@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 
 DEFAULT_ENV_PATHS = (
     Path(".env"),
-    Path("/home/bot/bots/yvusd-bots/.env"),
 )
 
 

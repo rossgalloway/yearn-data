@@ -18,9 +18,6 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
 ]
-yprice = [
-    "ypricemagic>=5.2.25",
-]
 
 [project.scripts]
 yearn-data = "yearn_data.cli:main"

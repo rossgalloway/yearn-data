@@ -9,7 +9,7 @@ from yearn_data.pricing import (
 from yearn_data.storage import connect, init_db, seed_chains
 
 
-def test_price_unpriced_reports_uses_defillama_primary_and_yprice_fallback(monkeypatch, tmp_path):
+def test_price_unpriced_reports_records_defillama_missing_without_fallback(monkeypatch, tmp_path):
     conn = connect(tmp_path / "test.sqlite")
     init_db(conn)
     seed_chains(conn, CHAINS)
@@ -26,34 +26,19 @@ def test_price_unpriced_reports_uses_defillama_primary_and_yprice_fallback(monke
                 6, '1', '0', '1', '{}')
         """
     )
-    conn.execute(
-        """
-        INSERT INTO prices (
-            chain_id, token_address, timestamp, block_number, source, price_usd, status
-        )
-        VALUES (1, '0x0000000000000000000000000000000000000002', 100, 10, 'yprice', NULL, 'error')
-        """
-    )
-    conn.commit()
-
     def fake_defillama_batch(requests_):
         return {
             (chain_id, token_address, timestamp): (None, "error", {"source": "defillama"})
             for chain_id, token_address, timestamp in requests_
         }
 
-    def fake_yprice(chain_id, token_address, block_number):
-        return 2.0, "ok", {"source": "yprice"}
-
     monkeypatch.setattr("yearn_data.pricing.fetch_defillama_prices_batch", fake_defillama_batch)
-    monkeypatch.setattr("yearn_data.pricing.fetch_yprice_price", fake_yprice)
-    count = price_unpriced_reports(conn, source="defillama", fallback="yprice")
-    assert count == 2
-    statuses = {
-        row["source"]: row["status"]
-        for row in conn.execute("SELECT source, status FROM prices").fetchall()
-    }
-    assert statuses == {"defillama": "error", "yprice": "ok"}
+    count = price_unpriced_reports(conn, source="defillama", fallback=None, onchain_fallbacks=False)
+    assert count == 1
+    row = conn.execute("SELECT source, price_usd, status FROM prices").fetchone()
+    assert row["source"] == "defillama"
+    assert row["price_usd"] is None
+    assert row["status"] == "error"
 
 
 def test_price_unpriced_volume_uses_flow_tables(monkeypatch, tmp_path):

@@ -22,7 +22,7 @@ from .storage import to_json
 
 
 DEFILLAMA_BASE = "https://coins.llama.fi"
-SUPPORTED_SOURCES = {"defillama", "yprice"}
+SUPPORTED_SOURCES = {"defillama"}
 ETHEREUM_WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 POLYGON_STABLE_ALIASES = {
     "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",  # bridged USDC
@@ -245,62 +245,6 @@ def _canonical_eth_source(chain_id: int, address: str) -> str | None:
     if chain_id == 747474 and address in KATANA_ETH_WRAPPERS:
         return "canonical_katana_eth_wrapper_fallback"
     return None
-
-
-def _brownie_network_id(chain_id: int) -> str:
-    # ypricemagic uses Brownie network ids. These names match common Brownie config.
-    mapping = {
-        1: "yearn-mainnet",
-        137: "yearn-polygon",
-        8453: "yearn-base",
-        42161: "yearn-arbitrum",
-        747474: "yearn-katana",
-    }
-    if chain_id not in mapping:
-        raise ValueError(f"yprice network mapping is not configured for chain_id={chain_id}")
-    return mapping[chain_id]
-
-
-def fetch_yprice_price(chain_id: int, token_address: str, block_number: int) -> tuple[float | None, str, dict[str, Any]]:
-    """Fetch historical price from ypricemagic if the optional dependency is installed."""
-    previous_network = os.environ.get("BROWNIE_NETWORK_ID")
-    previous_provider = os.environ.get("WEB3_PROVIDER_URI")
-    previous_etherscan = os.environ.get("ETHERSCAN_TOKEN")
-    previous_typedenvs = os.environ.get("TYPEDENVS_SHUTUP")
-    os.environ.setdefault("BROWNIE_NETWORK_ID", _brownie_network_id(chain_id))
-    chain = next(c.key for c in CHAINS.values() if c.chain_id == int(chain_id))
-    os.environ.setdefault("WEB3_PROVIDER_URI", get_rpc_url(chain))
-    os.environ.setdefault("TYPEDENVS_SHUTUP", "1")
-    if previous_etherscan is None and os.environ.get("ETHERSCAN_API_KEY"):
-        os.environ["ETHERSCAN_TOKEN"] = os.environ["ETHERSCAN_API_KEY"]
-    try:
-        from y import get_price  # type: ignore
-
-        price = get_price(token_address, int(block_number), fail_to_None=True, sync=True)
-        if price is None:
-            return None, "missing", {"block": int(block_number)}
-        return float(price), "ok", {"block": int(block_number)}
-    except ModuleNotFoundError as exc:
-        return None, "unavailable", {"error": f"optional ypricemagic dependency not installed: {exc}"}
-    except Exception as exc:
-        return None, "error", {"error": str(exc), "block": int(block_number)}
-    finally:
-        if previous_network is None:
-            os.environ.pop("BROWNIE_NETWORK_ID", None)
-        else:
-            os.environ["BROWNIE_NETWORK_ID"] = previous_network
-        if previous_provider is None:
-            os.environ.pop("WEB3_PROVIDER_URI", None)
-        else:
-            os.environ["WEB3_PROVIDER_URI"] = previous_provider
-        if previous_etherscan is None:
-            os.environ.pop("ETHERSCAN_TOKEN", None)
-        else:
-            os.environ["ETHERSCAN_TOKEN"] = previous_etherscan
-        if previous_typedenvs is None:
-            os.environ.pop("TYPEDENVS_SHUTUP", None)
-        else:
-            os.environ["TYPEDENVS_SHUTUP"] = previous_typedenvs
 
 
 def report_amount(raw_value: str | int, decimals: int | None) -> Decimal:
@@ -673,8 +617,6 @@ def _row_level_fallback_price(chain_id: int, token_address: str, timestamp: int,
 def _fetch_price(source: str, chain_id: int, token_address: str, timestamp: int, block_number: int):
     if source == "defillama":
         return fetch_defillama_price(chain_id, token_address, timestamp)
-    if source == "yprice":
-        return fetch_yprice_price(chain_id, token_address, block_number)
     raise ValueError(f"unsupported price source {source!r}; expected {sorted(SUPPORTED_SOURCES)}")
 
 
@@ -682,7 +624,7 @@ def price_unpriced_reports(
     conn,
     limit: int | None = None,
     source: str = "defillama",
-    fallback: str | None = "yprice",
+    fallback: str | None = None,
     retry_missing: bool = False,
     chain_ids: set[int] | None = None,
     onchain_fallbacks: bool = True,
@@ -770,7 +712,7 @@ def price_unpriced_volume(
     conn,
     limit: int | None = None,
     source: str = "defillama",
-    fallback: str | None = "yprice",
+    fallback: str | None = None,
     retry_missing: bool = False,
     chain_ids: set[int] | None = None,
     onchain_fallbacks: bool = True,
@@ -892,18 +834,6 @@ def _price_unpriced_reports_defillama_batched(
     onchain_fallbacks: bool = True,
 ) -> int:
     count = 0
-    blocked_fallback_tokens = {
-        (int(row["chain_id"]), row["token_address"].lower())
-        for row in conn.execute(
-            """
-            SELECT chain_id, token_address
-            FROM prices
-            WHERE source='yprice' AND status != 'ok'
-            GROUP BY chain_id, lower(token_address)
-            HAVING COUNT(*) >= 3
-            """
-        ).fetchall()
-    }
     batches = list(_defillama_coin_batches(rows))
     workers = max(1, int(os.environ.get("YEARN_DATA_PRICE_WORKERS", "8")))
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -916,7 +846,6 @@ def _price_unpriced_reports_defillama_batched(
                     row,
                     results,
                     fallback,
-                    blocked_fallback_tokens,
                     onchain_fallbacks=onchain_fallbacks,
                 )
             if count % 500 == 0:
@@ -946,7 +875,6 @@ def _write_defillama_price_row(
     row,
     results,
     fallback: str | None,
-    blocked_fallback_tokens: set[tuple[int, str]],
     onchain_fallbacks: bool = True,
 ) -> int:
     chain_id = int(row["chain_id"])
@@ -985,38 +913,6 @@ def _write_defillama_price_row(
             to_json(payload),
         ),
     )
-    if status != "ok" and fallback and fallback != "defillama":
-        fallback_key = (chain_id, token_address.lower())
-        if fallback_key in blocked_fallback_tokens:
-            fallback_price, fallback_status, fallback_payload = (
-                None,
-                "skipped",
-                {"reason": "prior yprice failures for token"},
-            )
-        else:
-            fallback_price, fallback_status, fallback_payload = fetch_yprice_price(chain_id, token_address, block_number)
-            if fallback_status != "ok":
-                blocked_fallback_tokens.add(fallback_key)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO prices (
-                chain_id, token_address, timestamp, block_number,
-                source, price_usd, status, raw_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                chain_id,
-                token_address,
-                timestamp,
-                block_number,
-                fallback,
-                fallback_price,
-                fallback_status,
-                to_json(fallback_payload),
-            ),
-        )
-        return 2
     return 1
 
 

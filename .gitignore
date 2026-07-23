@@ -2,7 +2,11 @@
 __pycache__/
 *.py[cod]
 .venv/
-data/yearn.sqlite
-data/yearn.sqlite-*
-artifacts/*.zst
-exports/vault-volume/
+*.egg-info/
+data/
+exports/
+artifacts/
+*.sqlite
+*.sqlite-*
+*.db
+*.zst
