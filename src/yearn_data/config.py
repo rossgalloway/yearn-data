@@ -77,6 +77,34 @@ def get_rpc_url(chain: str) -> str:
         raise ValueError(f"missing RPC for {cfg.key}; set {cfg.rpc_env}")
     return value
 
+def get_rpc_urls(chain: str) -> list[str]:
+    """RPC endpoints for a chain; comma-separated values are tried in order."""
+    return [url.strip() for url in get_rpc_url(chain).split(",") if url.strip()]
+
+
+KONG_GRAPHQL_DEFAULT_URL = "https://kong.yearn.fi/api/gql"
+
+
+def get_envio_graphql_url() -> str:
+    """Envio Hasura GraphQL endpoint used when event source is ``envio``."""
+    value = os.environ.get("YEARN_ENVIO_GRAPHQL_URL")
+    if not value:
+        raise ValueError("missing Envio endpoint; set YEARN_ENVIO_GRAPHQL_URL")
+    return value
+
+
+def get_kong_graphql_url() -> str:
+    """Yearn Kong GraphQL endpoint for vault and underlying-token metadata."""
+    return os.environ.get("YEARN_KONG_GRAPHQL_URL", KONG_GRAPHQL_DEFAULT_URL)
+
+
+def get_event_source() -> str:
+    """Configured indexing backend: Envio by default, legacy RPC on request."""
+    value = os.environ.get("YEARN_DATA_EVENT_SOURCE", "envio").strip().lower()
+    if value not in {"envio", "rpc"}:
+        raise ValueError(f"YEARN_DATA_EVENT_SOURCE must be 'rpc' or 'envio', got {value!r}")
+    return value
+
 
 def get_etherscan_api_key() -> str | None:
     return os.environ.get("ETHERSCAN_API_KEY")

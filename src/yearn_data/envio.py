@@ -1,0 +1,808 @@
+"""Envio-backed discovery and report ingestion for lifetime-yield.
+
+The Envio Hasura endpoint supplies decoded report events and their block timestamps,
+replacing the expensive RPC ``eth_getLogs``/``eth_getBlock`` backfill path. Yearn
+Kong supplies missing vault and underlying-token metadata, including
+``asset.decimals``, so Envio ingestion needs no RPC endpoint.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from collections import defaultdict
+from typing import Any, Callable, Iterable
+
+import requests
+from web3 import Web3
+
+from .config import CHAINS, get_envio_graphql_url
+from .discovery import VaultRecord
+from .kong import vault_metadata_from_kong
+from .indexing import (
+    ZERO_ADDRESS,
+    ProgressCallback,
+    _cached_vault_share_prices_many,
+    get_index_state,
+    index_v2_debt_flows_from_reports,
+    insert_strategy_debt_flow,
+    insert_strategy_report,
+    insert_vault_fee_event,
+    insert_vault_flow,
+    normalize_strategy_report,
+    normalize_v3_debt_flow,
+    normalize_vault_flow,
+    set_index_state,
+)
+V3_REPORT_FIELDS = (
+    "gain loss current_debt protocol_fees total_fees total_refunds "
+    "strategy vaultAddress chainId blockNumber blockTimestamp transactionHash logIndex"
+)
+V2_REPORT_FIELDS = (
+    "gain loss debtAdded debtPaid totalGain totalLoss totalDebt debtRatio "
+    "strategy vaultAddress chainId blockNumber blockTimestamp transactionHash logIndex"
+)
+V3_DISCOVERY_ENTITIES = ("StrategyReported", "Deposit", "Withdraw", "DebtUpdated")
+V2_DISCOVERY_ENTITIES = ("V2StrategyReported", "V2Deposit", "V2Withdraw", "Transfer")
+
+DEFAULT_PAGE_SIZE = 1_000
+
+DEPOSIT_FIELDS = (
+    "sender owner assets shares "
+    "vaultAddress chainId blockNumber blockTimestamp transactionHash logIndex"
+)
+WITHDRAW_FIELDS = (
+    "sender owner receiver assets shares "
+    "vaultAddress chainId blockNumber blockTimestamp transactionHash logIndex"
+)
+V2_DEPOSIT_FIELDS = (
+    "recipient amount shares "
+    "vaultAddress chainId blockNumber blockTimestamp transactionHash logIndex"
+)
+V2_WITHDRAW_FIELDS = V2_DEPOSIT_FIELDS
+DEBT_UPDATED_FIELDS = (
+    "strategy current_debt new_debt "
+    "vaultAddress chainId blockNumber blockTimestamp transactionHash logIndex"
+)
+
+V2_FEE_TRANSFER_FIELDS = (
+    "vaultAddress sender receiver value "
+    "chainId blockNumber blockTimestamp transactionHash logIndex"
+)
+DEFAULT_WINDOW_BLOCKS = 1_000_000
+DEFAULT_REQUEST_TIMEOUT = 120
+
+
+def _page_size() -> int:
+    try:
+        return max(100, int(os.environ.get("YEARN_ENVIO_PAGE_SIZE", DEFAULT_PAGE_SIZE)))
+    except ValueError:
+        return DEFAULT_PAGE_SIZE
+
+
+def _window_blocks() -> int:
+    try:
+        return max(10_000, int(os.environ.get("YEARN_ENVIO_WINDOW_BLOCKS", DEFAULT_WINDOW_BLOCKS)))
+    except ValueError:
+        return DEFAULT_WINDOW_BLOCKS
+
+
+def _gql(
+    query: str,
+    variables: dict[str, Any] | None = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+) -> dict[str, Any]:
+    """POST a GraphQL query to Envio with bounded retry on transient errors."""
+    payload: dict[str, Any] = {"query": query}
+    if variables:
+        payload["variables"] = variables
+
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            response = requests.post(get_envio_graphql_url(), json=payload, timeout=timeout)
+            if response.status_code == 429 or response.status_code >= 500:
+                last_error = RuntimeError(f"envio HTTP {response.status_code}")
+                time.sleep(2**attempt)
+                continue
+            response.raise_for_status()
+            body = response.json()
+            if "errors" in body:
+                raise RuntimeError(f"envio GraphQL errors: {body['errors']}")
+            return body["data"]
+        except requests.RequestException as exc:
+            last_error = exc
+            time.sleep(2**attempt)
+    raise RuntimeError("envio GraphQL request failed after retries") from last_error
+
+
+def _page_query(entity: str, fields: str, chain_id: int, lo: int, hi: int) -> str:
+    """Build a forward-cursored query over inclusive block window ``[lo, hi]``."""
+    where = (
+        f"chainId: {{_eq: {chain_id}}}, "
+        f"blockNumber: {{_gte: {lo}, _lte: {hi}}}, "
+        f"_or: [{{blockNumber: {{_gt: $lb}}}}, "
+        f"{{_and: [{{blockNumber: {{_eq: $lb}}}}, {{logIndex: {{_gt: $li}}}}]}}]"
+    )
+    return (
+        f"query($lb: Int!, $li: Int!, $n: Int!) {{ "
+        f"{entity}(where: {{{where}}}, "
+        f"order_by: [{{blockNumber: asc}}, {{logIndex: asc}}], limit: $n) {{ {fields} }} }}"
+    )
+
+
+def _pull_window(
+    entity: str,
+    fields: str,
+    chain_id: int,
+    lo: int,
+    hi: int,
+    page_size: int | None = None,
+) -> list[dict[str, Any]]:
+    """Read every event in an inclusive Envio block range."""
+    if lo > hi:
+        return []
+
+    query = _page_query(entity, fields, chain_id, lo, hi)
+    nodes: list[dict[str, Any]] = []
+    page_limit = page_size or _page_size()
+    block_number, log_index = lo - 1, -1
+    while True:
+        data = _gql(query, {"lb": block_number, "li": log_index, "n": page_limit})
+        page = data.get(entity) or []
+        if not page:
+            break
+        nodes.extend(page)
+        if len(page) < page_limit:
+            break
+        last = page[-1]
+        block_number, log_index = int(last["blockNumber"]), int(last["logIndex"])
+    return nodes
+
+
+def _windows(lo: int, hi: int, size: int) -> Iterable[tuple[int, int]]:
+    """Yield inclusive, non-overlapping block windows."""
+    current = lo
+    while current <= hi:
+        end = min(current + size - 1, hi)
+        yield current, end
+        current = end + 1
+
+
+def latest_processed_block(chain_id: int) -> int:
+    """Return Envio's highest fully processed block for a chain."""
+    data = _gql(
+        "query($chain: Int!) { chain_metadata(where: {chain_id: {_eq: $chain}}) "
+        "{ latest_processed_block } }",
+        {"chain": int(chain_id)},
+    )
+    rows = data.get("chain_metadata") or []
+    if not rows:
+        raise RuntimeError(f"envio chain_metadata missing for chain_id {chain_id}")
+    return int(rows[0]["latest_processed_block"])
+
+
+def _resolve_to_block(chain: str, to_block: int | None) -> int:
+    if to_block is not None:
+        return int(to_block)
+    return latest_processed_block(CHAINS[chain].chain_id)
+
+
+def _cursor_event(entity: str) -> str:
+    return f"{entity}:envio"
+
+
+def _get_envio_cursor(conn, chain_id: int, entity: str) -> int | None:
+    return get_index_state(conn, chain_id, "*", _cursor_event(entity))
+
+
+def _set_envio_cursor(conn, chain_id: int, entity: str, last_block: int) -> None:
+    set_index_state(conn, chain_id, "*", _cursor_event(entity), last_block)
+
+
+def _vault_asset_map(conn, chain_id: int) -> dict[str, tuple[str | None, int | None]]:
+    rows = conn.execute(
+        "SELECT address, asset, asset_decimals FROM vaults WHERE chain_id=? AND management='yearn'",
+        (chain_id,),
+    ).fetchall()
+    return {
+        Web3.to_checksum_address(row["address"]).lower(): (
+            Web3.to_checksum_address(row["asset"]) if row["asset"] else None,
+            int(row["asset_decimals"]) if row["asset_decimals"] is not None else None,
+        )
+        for row in rows
+    }
+
+
+def _log(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "transactionHash": node["transactionHash"],
+        "logIndex": int(node["logIndex"]),
+        "blockNumber": int(node["blockNumber"]),
+    }
+
+
+def _v3_report_args(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "strategy": node["strategy"],
+        "gain": int(node["gain"]),
+        "loss": int(node["loss"]),
+        "current_debt": int(node["current_debt"]),
+        "protocol_fees": int(node["protocol_fees"]),
+        "total_fees": int(node["total_fees"]),
+        "total_refunds": int(node["total_refunds"]),
+    }
+
+
+def _v2_report_args(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "strategy": node["strategy"],
+        "gain": int(node["gain"]),
+        "loss": int(node["loss"]),
+        "debtPaid": int(node["debtPaid"]),
+        "totalGain": int(node["totalGain"]),
+        "totalLoss": int(node["totalLoss"]),
+        "totalDebt": int(node["totalDebt"]),
+        "debtAdded": int(node["debtAdded"]),
+        "debtRatio": int(node["debtRatio"]),
+    }
+
+
+def _v3_deposit_args(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sender": node["sender"],
+        "owner": node["owner"],
+        "assets": int(node["assets"]),
+        "shares": int(node["shares"]),
+    }
+
+
+def _v3_withdraw_args(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sender": node["sender"],
+        "owner": node["owner"],
+        "receiver": node["receiver"],
+        "assets": int(node["assets"]),
+        "shares": int(node["shares"]),
+    }
+
+
+def _v3_debt_args(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "strategy": node["strategy"],
+        "current_debt": int(node["current_debt"]),
+        "new_debt": int(node["new_debt"]),
+    }
+
+
+def _v2_flow_args(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "recipient": node["recipient"],
+        "amount": int(node["amount"]),
+        "shares": int(node["shares"]),
+    }
+
+
+def _import_report_entity(
+    conn,
+    chain: str,
+    entity: str,
+    version: str,
+    fields: str,
+    hi: int,
+    assets: dict[str, tuple[str | None, int | None]],
+    args_for_node: Callable[[dict[str, Any]], dict[str, Any]],
+    progress: ProgressCallback | None,
+) -> int:
+    cfg = CHAINS[chain]
+    cursor = _get_envio_cursor(conn, cfg.chain_id, entity)
+    lo = cursor + 1 if cursor is not None else 0
+    if lo > hi:
+        return 0
+
+    inserted = 0
+    for window_lo, window_hi in _windows(lo, hi, _window_blocks()):
+        nodes = _pull_window(entity, fields, cfg.chain_id, window_lo, window_hi)
+        for node in nodes:
+            vault = Web3.to_checksum_address(node["vaultAddress"])
+            if vault.lower() not in assets:
+                continue
+            asset, decimals = assets[vault.lower()]
+            row = normalize_strategy_report(
+                cfg.chain_id,
+                version,
+                vault,
+                asset,
+                decimals,
+                _log(node),
+                int(node["blockTimestamp"]),
+                args_for_node(node),
+            )
+            insert_strategy_report(conn, row)
+            inserted += 1
+        _set_envio_cursor(conn, cfg.chain_id, entity, window_hi)
+        conn.commit()
+        if progress and nodes:
+            progress(f"{chain} {version}: {entity} pulled through block {window_hi} (+{len(nodes)} reports)")
+    return inserted
+
+
+def import_reports_from_envio(
+    conn,
+    chains: list[str],
+    versions: list[str] | None = None,
+    to_block: int | None = None,
+    progress: ProgressCallback | None = None,
+) -> int:
+    """Import decoded V2/V3 report deltas without RPC log or block lookups."""
+    requested_versions = set(versions or ("v2", "v3"))
+    total = 0
+    for chain in chains:
+        cfg = CHAINS[chain]
+        hi = _resolve_to_block(chain, to_block)
+        assets = _vault_asset_map(conn, cfg.chain_id)
+        if "v3" in requested_versions:
+            total += _import_report_entity(
+                conn, chain, "StrategyReported", "v3", V3_REPORT_FIELDS, hi, assets, _v3_report_args, progress
+            )
+        if "v2" in requested_versions:
+            total += _import_report_entity(
+                conn, chain, "V2StrategyReported", "v2", V2_REPORT_FIELDS, hi, assets, _v2_report_args, progress
+            )
+    conn.commit()
+    return total
+
+
+
+
+def _import_flow_entity(
+    conn,
+    chain: str,
+    entity: str,
+    event_name: str,
+    version: str,
+    fields: str,
+    hi: int,
+    assets: dict[str, tuple[str | None, int | None]],
+    args_for_node: Callable[[dict[str, Any]], dict[str, Any]],
+    progress: ProgressCallback | None,
+) -> int:
+    cfg = CHAINS[chain]
+    cursor = _get_envio_cursor(conn, cfg.chain_id, entity)
+    lo = cursor + 1 if cursor is not None else 0
+    if lo > hi:
+        return 0
+
+    inserted = 0
+    for window_lo, window_hi in _windows(lo, hi, _window_blocks()):
+        nodes = _pull_window(entity, fields, cfg.chain_id, window_lo, window_hi)
+        for node in nodes:
+            vault = Web3.to_checksum_address(node["vaultAddress"])
+            if vault.lower() not in assets:
+                continue
+            asset, decimals = assets[vault.lower()]
+            inserted += insert_vault_flow(
+                conn,
+                normalize_vault_flow(
+                    cfg.chain_id,
+                    version,
+                    vault,
+                    asset,
+                    decimals,
+                    _log(node),
+                    int(node["blockTimestamp"]),
+                    event_name,
+                    args_for_node(node),
+                ),
+            )
+        _set_envio_cursor(conn, cfg.chain_id, entity, window_hi)
+        conn.commit()
+        if progress and nodes:
+            progress(f"{chain} {version}: {entity} pulled through block {window_hi} (+{len(nodes)} flows)")
+    return inserted
+
+
+def _import_v3_debt_entity(
+    conn,
+    chain: str,
+    hi: int,
+    assets: dict[str, tuple[str | None, int | None]],
+    progress: ProgressCallback | None,
+) -> int:
+    cfg = CHAINS[chain]
+    entity = "DebtUpdated"
+    cursor = _get_envio_cursor(conn, cfg.chain_id, entity)
+    lo = cursor + 1 if cursor is not None else 0
+    if lo > hi:
+        return 0
+
+    inserted = 0
+    for window_lo, window_hi in _windows(lo, hi, _window_blocks()):
+        nodes = _pull_window(entity, DEBT_UPDATED_FIELDS, cfg.chain_id, window_lo, window_hi)
+        for node in nodes:
+            vault = Web3.to_checksum_address(node["vaultAddress"])
+            if vault.lower() not in assets:
+                continue
+            asset, decimals = assets[vault.lower()]
+            row = normalize_v3_debt_flow(
+                cfg.chain_id,
+                "v3",
+                vault,
+                asset,
+                decimals,
+                _log(node),
+                int(node["blockTimestamp"]),
+                _v3_debt_args(node),
+            )
+            if row is not None:
+                inserted += insert_strategy_debt_flow(conn, row)
+        _set_envio_cursor(conn, cfg.chain_id, entity, window_hi)
+        conn.commit()
+        if progress and nodes:
+            progress(f"{chain} v3: DebtUpdated pulled through block {window_hi} (+{len(nodes)} events)")
+    return inserted
+
+
+def import_flows_from_envio(
+    conn,
+    chains: list[str],
+    versions: list[str] | None = None,
+    to_block: int | None = None,
+    progress: ProgressCallback | None = None,
+) -> int:
+    """Import decoded user and strategy-volume events without RPC log scans."""
+    requested_versions = set(versions or ("v2", "v3"))
+    total = 0
+    for chain in chains:
+        cfg = CHAINS[chain]
+        hi = _resolve_to_block(chain, to_block)
+        assets = _vault_asset_map(conn, cfg.chain_id)
+        if "v3" in requested_versions:
+            total += _import_flow_entity(
+                conn, chain, "Deposit", "Deposit", "v3", DEPOSIT_FIELDS, hi, assets, _v3_deposit_args, progress
+            )
+            total += _import_flow_entity(
+                conn, chain, "Withdraw", "Withdraw", "v3", WITHDRAW_FIELDS, hi, assets, _v3_withdraw_args, progress
+            )
+            total += _import_v3_debt_entity(conn, chain, hi, assets, progress)
+        if "v2" in requested_versions:
+            total += _import_flow_entity(
+                conn, chain, "V2Deposit", "Deposit", "v2", V2_DEPOSIT_FIELDS, hi, assets, _v2_flow_args, progress
+            )
+            total += _import_flow_entity(
+                conn, chain, "V2Withdraw", "Withdraw", "v2", V2_WITHDRAW_FIELDS, hi, assets, _v2_flow_args, progress
+            )
+    if "v2" in requested_versions:
+        total += index_v2_debt_flows_from_reports(conn, chains=chains)
+    conn.commit()
+    return total
+
+
+
+V2_FEE_TRANSFER_TX_BATCH_SIZE = 500
+
+
+def _pull_v2_fee_transfers(transaction_hashes: list[str]) -> list[dict[str, Any]]:
+    """Return every Ethereum vault-share Transfer for report transactions."""
+    query = f"""
+    query($txs: [String!], $lb: Int!, $li: Int!, $n: Int!) {{
+      Transfer(
+        where: {{
+          chainId: {{_eq: 1}},
+          transactionHash: {{_in: $txs}},
+          _or: [
+            {{blockNumber: {{_gt: $lb}}}},
+            {{_and: [{{blockNumber: {{_eq: $lb}}}}, {{logIndex: {{_gt: $li}}}}]}}
+          ]
+        }},
+        order_by: [{{blockNumber: asc}}, {{logIndex: asc}}],
+        limit: $n
+      ) {{ {V2_FEE_TRANSFER_FIELDS} }}
+    }}
+    """
+    nodes: list[dict[str, Any]] = []
+    block_number, log_index = -1, -1
+    while True:
+        data = _gql(
+            query,
+            {"txs": transaction_hashes, "lb": block_number, "li": log_index, "n": _page_size()},
+        )
+        page = data.get("Transfer") or []
+        if not page:
+            return nodes
+        nodes.extend(page)
+        if len(page) < _page_size():
+            return nodes
+        last = page[-1]
+        block_number, log_index = int(last["blockNumber"]), int(last["logIndex"])
+
+
+def index_v2_fee_mints_from_envio(conn, progress: ProgressCallback | None = None) -> int:
+    """Index exact V2 harvest fee assets using Envio transfers and archive PPS calls.
+
+    V2 reports omit fee amounts. Envio supplies the same vault-share transfers
+    previously fetched one receipt at a time; an archive RPC remains necessary
+    only to convert candidate fee shares at the harvest block's PPS.
+    """
+    chain_id = CHAINS["eth"].chain_id
+    last_done = get_index_state(conn, chain_id, "v2-fee-mints:envio", "Transfer")
+    params: list[Any] = [chain_id]
+    block_filter = ""
+    if last_done is not None:
+        block_filter = "AND block_number > ?"
+        params.append(last_done)
+    report_rows = conn.execute(
+        f"""
+        SELECT
+            chain_id,
+            tx_hash,
+            vault_address,
+            MIN(strategy_address) AS strategy_address,
+            COUNT(DISTINCT strategy_address) AS strategy_count,
+            MIN(block_number) AS block_number,
+            MIN(block_timestamp) AS block_timestamp,
+            MIN(asset) AS asset,
+            MIN(asset_decimals) AS asset_decimals
+        FROM strategy_reports
+        WHERE version='v2' AND chain_id=? {block_filter}
+        GROUP BY chain_id, tx_hash, vault_address
+        ORDER BY block_number, tx_hash, vault_address
+        """,
+        params,
+    ).fetchall()
+    if not report_rows:
+        return 0
+
+    reports_by_pair = {
+        (str(row["tx_hash"]).lower(), Web3.to_checksum_address(row["vault_address"]).lower()): row
+        for row in report_rows
+    }
+    tx_hashes = sorted({str(row["tx_hash"]).lower() for row in report_rows})
+    candidates: list[tuple[Any, dict[str, Any], int, str, str]] = []
+    zero_address = Web3.to_checksum_address(ZERO_ADDRESS).lower()
+    for offset in range(0, len(tx_hashes), V2_FEE_TRANSFER_TX_BATCH_SIZE):
+        batch = tx_hashes[offset : offset + V2_FEE_TRANSFER_TX_BATCH_SIZE]
+        transfers_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for transfer in _pull_v2_fee_transfers(batch):
+            key = (
+                str(transfer["transactionHash"]).lower(),
+                Web3.to_checksum_address(transfer["vaultAddress"]).lower(),
+            )
+            if key in reports_by_pair:
+                transfers_by_pair[key].append(transfer)
+        for key, transfers in transfers_by_pair.items():
+            fee_mints = [
+                transfer
+                for transfer in transfers
+                if int(transfer["value"]) > 0
+                and Web3.to_checksum_address(transfer["sender"]).lower() == zero_address
+                and Web3.to_checksum_address(transfer["receiver"]).lower() == key[1]
+            ]
+            if not fee_mints:
+                continue
+            transfer_out = [
+                transfer
+                for transfer in transfers
+                if int(transfer["value"]) > 0
+                and Web3.to_checksum_address(transfer["sender"]).lower() == key[1]
+                and Web3.to_checksum_address(transfer["receiver"]).lower() != zero_address
+            ]
+            source = "v2_harvest_fee_transfer" if transfer_out else "v2_harvest_fee_mint_unsplit"
+            candidates.extend(
+                (reports_by_pair[key], transfer, int(transfer["value"]), transfer["receiver"], source)
+                for transfer in transfer_out or fee_mints
+            )
+        if progress:
+            progress(f"eth v2 fees: fetched Envio transfers for {min(offset + len(batch), len(tx_hashes))}/{len(tx_hashes)} report transactions")
+
+    if not candidates:
+        set_index_state(conn, chain_id, "v2-fee-mints:envio", "Transfer", int(report_rows[-1]["block_number"]))
+        return 0
+
+    vaults_by_address = {
+        Web3.to_checksum_address(row["address"]): row
+        for row in conn.execute(
+            "SELECT * FROM vaults WHERE chain_id=? AND version='v2'", (chain_id,)
+        )
+    }
+    metadata_by_vault = vault_metadata_from_kong(
+        chain_id,
+        sorted({Web3.to_checksum_address(transfer["vaultAddress"]) for _, transfer, _, _, _ in candidates}),
+    )
+    share_decimals_by_address = {
+        address: int(metadata["share_decimals"])
+        for address, metadata in metadata_by_vault.items()
+        if metadata["share_decimals"] is not None
+    }
+    candidate_logs = [
+        {"address": transfer["vaultAddress"], "blockNumber": int(transfer["blockNumber"])}
+        for _, transfer, _, _, _ in candidates
+    ]
+    pps_cache = _cached_vault_share_prices_many(
+        conn,
+        "eth",
+        vaults_by_address,
+        candidate_logs,
+        share_decimals_by_address=share_decimals_by_address,
+    )
+
+    inserted = 0
+    for report, transfer, shares, recipient, source in candidates:
+        vault = Web3.to_checksum_address(transfer["vaultAddress"])
+        block_number = int(transfer["blockNumber"])
+        price_per_share, share_decimals = pps_cache[(vault, block_number)]
+        assets = shares * price_per_share // (10**share_decimals)
+        inserted += insert_vault_fee_event(
+            conn,
+            (
+                chain_id,
+                "v2",
+                source,
+                vault,
+                Web3.to_checksum_address(report["strategy_address"]) if int(report["strategy_count"]) == 1 else None,
+                Web3.to_checksum_address(recipient),
+                transfer["transactionHash"],
+                int(transfer["logIndex"]),
+                block_number,
+                int(transfer["blockTimestamp"]),
+                Web3.to_checksum_address(report["asset"]) if report["asset"] else None,
+                report["asset_decimals"],
+                str(assets),
+                str(shares),
+                None,
+                None,
+                None,
+                json.dumps(
+                    {
+                        "source_event": "Transfer",
+                        "fee_source": source,
+                        "from": transfer["sender"],
+                        "to": recipient,
+                        "value": str(shares),
+                        "price_per_share_raw": str(price_per_share),
+                        "share_decimals": share_decimals,
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+    set_index_state(conn, chain_id, "v2-fee-mints:envio", "Transfer", int(report_rows[-1]["block_number"]))
+    conn.commit()
+    return inserted
+def _distinct_vault_addresses(chain_id: int, entities: Iterable[str]) -> set[str]:
+    addresses: set[str] = set()
+    for entity in entities:
+        data = _gql(
+            f"query {{ {entity}(distinct_on: [vaultAddress], "
+            f"where: {{chainId: {{_eq: {chain_id}}}}}, "
+            f"order_by: [{{vaultAddress: asc}}], limit: 50000) {{ vaultAddress }} }}"
+        )
+        for node in data.get(entity) or []:
+            if node.get("vaultAddress"):
+                addresses.add(Web3.to_checksum_address(node["vaultAddress"]))
+    return addresses
+
+
+def _existing_vaults(conn, chain_id: int) -> dict[str, Any]:
+    rows = conn.execute("SELECT * FROM vaults WHERE chain_id=?", (chain_id,)).fetchall()
+    return {Web3.to_checksum_address(row["address"]).lower(): row for row in rows}
+
+
+def _build_envio_vault_records(
+    conn,
+    chain: str,
+    version: str,
+    addresses: list[str],
+) -> list[VaultRecord]:
+    """Reuse cached metadata; resolve only missing records through Yearn Kong."""
+    cfg = CHAINS[chain]
+    existing = _existing_vaults(conn, cfg.chain_id)
+    normalized = [Web3.to_checksum_address(address) for address in addresses]
+    metadata_targets = [
+        address
+        for address in normalized
+        if (row := existing.get(address.lower())) is None
+        or row["asset"] is None
+        or row["asset_decimals"] is None
+    ]
+    metadata_by_address = vault_metadata_from_kong(cfg.chain_id, metadata_targets) if metadata_targets else {}
+
+    records: list[VaultRecord] = []
+    for address in normalized:
+        row = existing.get(address.lower())
+        metadata = metadata_by_address.get(address)
+        asset = metadata["asset"] if metadata else row["asset"] if row else None
+        asset_symbol = metadata["asset_symbol"] if metadata else row["asset_symbol"] if row else None
+        asset_decimals = metadata["asset_decimals"] if metadata else row["asset_decimals"] if row else None
+        name = metadata["name"] if metadata else row["name"] if row else None
+        api_version = metadata["api_version"] if metadata else row["api_version"] if row else None
+        if metadata is None and row is None:
+            continue
+
+        records.append(
+            VaultRecord(
+                chain_id=cfg.chain_id,
+                version=version,
+                address=address,
+                source_address=row["source_address"] if row else None,
+                asset=asset,
+                asset_symbol=asset_symbol,
+                asset_decimals=int(asset_decimals) if asset_decimals is not None else None,
+                name=name,
+                api_version=api_version,
+                deployment_block=row["deployment_block"] if row else None,
+                management=row["management"] if row else "yearn",
+                protocol=row["protocol"] if row else None,
+            )
+        )
+    return records
+
+
+def _upsert_envio_vaults(conn, vaults: list[VaultRecord]) -> int:
+    """Refresh metadata without replacing facts absent from Envio event rows."""
+    if not vaults:
+        return 0
+    now = int(time.time())
+    rows = [
+        (
+            vault.chain_id,
+            vault.version,
+            vault.address,
+            vault.source_address,
+            vault.asset,
+            vault.asset_symbol,
+            vault.asset_decimals,
+            vault.name,
+            vault.api_version,
+            vault.management,
+            vault.protocol,
+            vault.deployment_block,
+            now,
+        )
+        for vault in vaults
+    ]
+    cur = conn.executemany(
+        """
+        INSERT INTO vaults (
+            chain_id, version, address, source_address, asset, asset_symbol,
+            asset_decimals, name, api_version, management, protocol,
+            deployment_block, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chain_id, address) DO UPDATE SET
+            version=excluded.version,
+            asset=excluded.asset,
+            asset_symbol=excluded.asset_symbol,
+            asset_decimals=excluded.asset_decimals,
+            name=excluded.name,
+            api_version=excluded.api_version,
+            updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def discover_from_envio(
+    conn,
+    chains: list[str],
+    skip_v2: bool = False,
+    progress: ProgressCallback | None = None,
+) -> int:
+    """Discover report-bearing V2/V3 vaults from Envio, caching metadata locally."""
+    records: list[VaultRecord] = []
+    for chain in chains:
+        cfg = CHAINS[chain]
+        v3_addresses = _distinct_vault_addresses(cfg.chain_id, V3_DISCOVERY_ENTITIES)
+        v2_addresses = (
+            set()
+            if skip_v2
+            else _distinct_vault_addresses(cfg.chain_id, V2_DISCOVERY_ENTITIES) - v3_addresses
+        )
+        if progress:
+            progress(f"{chain}: discovered {len(v3_addresses)} v3 + {len(v2_addresses)} v2 vaults from envio")
+        records.extend(_build_envio_vault_records(conn, chain, "v3", sorted(v3_addresses)))
+        records.extend(_build_envio_vault_records(conn, chain, "v2", sorted(v2_addresses)))
+    return _upsert_envio_vaults(conn, records)
