@@ -230,15 +230,23 @@ def test_v2_fee_import_uses_envio_transfers_and_batched_archive_pps(tmp_path, mo
 
 
 
-def test_cli_index_fees_is_disabled_for_envio_during_initial_benchmark(tmp_path, monkeypatch):
+def test_cli_index_fees_keeps_rpc_implementation_when_envio_is_selected(tmp_path, monkeypatch):
     from yearn_data import cli
 
     conn = _db(tmp_path)
-    monkeypatch.delenv("YEARN_DATA_EVENT_SOURCE", raising=False)
+    calls = []
+    monkeypatch.setenv("YEARN_DATA_EVENT_SOURCE", "envio")
     monkeypatch.setattr(cli, "open_db", lambda _path: conn)
+    monkeypatch.setattr(
+        cli,
+        "index_v2_fee_mints_from_reports",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 1,
+    )
 
-    with pytest.raises(ValueError, match="outside the initial report-event benchmark"):
-        cli.main(["--db", str(tmp_path / "unused.sqlite"), "index-fees", "--chains", "eth"])
+    assert cli.main(
+        ["--db", str(tmp_path / "unused.sqlite"), "index-fees", "--chains", "eth"]
+    ) == 0
+    assert len(calls) == 1
 
 def test_report_import_stops_before_advancing_for_an_unclassified_vault(tmp_path, monkeypatch):
     conn = _db(tmp_path)
@@ -554,23 +562,91 @@ def test_cli_routes_experimental_v2_option_to_envio_discovery(tmp_path, monkeypa
 
 
 
-def test_cli_combined_run_is_disabled_until_discovery_parity(tmp_path, monkeypatch):
+def test_cli_combined_lifetime_yield_uses_envio(tmp_path, monkeypatch):
     from yearn_data import cli
 
     conn = _db(tmp_path)
-    monkeypatch.delenv("YEARN_DATA_EVENT_SOURCE", raising=False)
+    calls = []
+    monkeypatch.setenv("YEARN_DATA_EVENT_SOURCE", "envio")
     monkeypatch.setattr(cli, "open_db", lambda _path: conn)
+    monkeypatch.setattr(
+        cli,
+        "discover_from_envio",
+        lambda *args, **kwargs: calls.append(("discover_envio", kwargs)) or 1,
+    )
+    monkeypatch.setattr(
+        cli,
+        "import_reports_from_envio",
+        lambda *args, **kwargs: calls.append(("reports_envio", kwargs)) or 2,
+    )
+    monkeypatch.setattr(
+        cli,
+        "discover",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected RPC discovery")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "index_all_reports",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected RPC report indexing")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "price_unpriced_reports",
+        lambda *args, **kwargs: calls.append(("price", kwargs)) or 3,
+    )
+    monkeypatch.setattr(cli, "_run_analysis", lambda *args: calls.append(("analyze", {})) or 4)
+    monkeypatch.setattr(cli, "export_analysis", lambda *args: [])
 
-    with pytest.raises(ValueError, match="discovery parity"):
-        cli.main(
-            [
-                "--db",
-                str(tmp_path / "unused.sqlite"),
-                "run",
-                "lifetime-yield",
-                "--chains",
-                "eth",
-                "--to-block",
-                "100",
-            ]
-        )
+    assert cli.main(
+        [
+            "--db",
+            str(tmp_path / "unused.sqlite"),
+            "run",
+            "lifetime-yield",
+            "--chains",
+            "eth",
+            "--to-block",
+            "100",
+        ]
+    ) == 0
+    assert [name for name, _ in calls] == [
+        "discover_envio",
+        "reports_envio",
+        "price",
+        "analyze",
+    ]
+    assert calls[0][1]["to_block"] == 100
+    assert calls[1][1]["to_block"] == 100
+
+
+def test_cli_combined_volume_keeps_rpc_path_when_envio_is_selected(tmp_path, monkeypatch):
+    from yearn_data import cli
+
+    conn = _db(tmp_path)
+    calls = []
+    monkeypatch.setenv("YEARN_DATA_EVENT_SOURCE", "envio")
+    monkeypatch.setattr(cli, "open_db", lambda _path: conn)
+    monkeypatch.setattr(cli, "discover", lambda *args, **kwargs: calls.append("discover_rpc") or 1)
+    monkeypatch.setattr(cli, "index_all_volume", lambda *args, **kwargs: calls.append("volume_rpc") or 2)
+    monkeypatch.setattr(cli, "price_unpriced_volume", lambda *args, **kwargs: calls.append("price_volume") or 3)
+    monkeypatch.setattr(cli, "_run_analysis", lambda *args: calls.append("analyze") or 4)
+    monkeypatch.setattr(cli, "export_analysis", lambda *args: [])
+    monkeypatch.setattr(
+        cli,
+        "discover_from_envio",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected Envio discovery")),
+    )
+
+    assert cli.main(
+        [
+            "--db",
+            str(tmp_path / "unused.sqlite"),
+            "run",
+            "vault-volume",
+            "--chains",
+            "eth",
+            "--to-block",
+            "100",
+        ]
+    ) == 0
+    assert calls == ["discover_rpc", "volume_rpc", "price_volume", "analyze"]

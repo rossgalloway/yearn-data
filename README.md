@@ -51,6 +51,11 @@ experimental deployments as well.
 Use `YEARN_DATA_EVENT_SOURCE=rpc` for the legacy RPC path or for a baseline
 benchmark.
 
+The source setting applies to vault discovery and strategy-report indexing,
+including `run lifetime-yield`. Vault-volume and fee indexing keep their existing
+RPC implementations until those Envio paths receive separate parity benchmarks,
+so their chain RPC variables are still required.
+
 ## Useful Options
 
 ```bash

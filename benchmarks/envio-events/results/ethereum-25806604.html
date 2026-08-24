@@ -58,6 +58,21 @@
   <p class="pass">Live pass: all 404 active addresses match, with no RPC-only or Envio-only vaults. V2 selects production registry events by default. V3 replays 74 role-manager additions and 37 removals in block/log order, leaving the same 37 active addresses as RPC discovery.</p>
   <p>The full report import was run from this independently discovered Envio database. Its 39,443 report keys and every normalized accounting field match the RPC baseline.</p>
 
+  <h2>Incremental check</h2>
+  <p class="pass">Pass: advancing the fixed-block database to block 25,826,895 imported 81 new reports. An immediate second run imported zero, confirming live cursor and deduplication behavior.</p>
+
+  <h2>Cross-chain cutover check</h2>
+  <table>
+    <thead><tr><th>Chain</th><th>RPC active</th><th>Envio active</th></tr></thead>
+    <tbody>
+      <tr><td>Polygon</td><td>7</td><td>0</td></tr>
+      <tr><td>Base</td><td>8</td><td>0</td></tr>
+      <tr><td>Arbitrum</td><td>6</td><td>0</td></tr>
+      <tr><td>Katana</td><td>8</td><td>0</td></tr>
+    </tbody>
+  </table>
+  <p class="blocker">Pending: the configured role managers on these chains predate Envio's indexed factory path. <a href="https://github.com/yearn/yearn-envio/pull/51">yearn-envio PR #51</a> adds them statically. Cross-chain discovery must be rerun after deployment and historical reindex.</p>
+
   <h2>Scope</h2>
   <p>Pricing and tokenized strategies were intentionally excluded. Both report runs used the same 404 main-discovered vault rows and the same per-vault start blocks.</p>
 </body>

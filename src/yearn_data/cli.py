@@ -192,8 +192,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "index-volume":
-        if event_source == "envio":
-            raise ValueError("Envio volume indexing is outside the initial report-event benchmark")
         count = index_all_volume(
             conn,
             _chains(args.chains),
@@ -206,8 +204,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "index-fees":
-        if event_source == "envio":
-            raise ValueError("Envio fee indexing is outside the initial report-event benchmark")
         count = index_v2_fee_mints_from_reports(conn, _chains(args.chains), progress=progress)
         print(f"indexed {count} fee events")
         return 0
@@ -267,22 +263,33 @@ def main(argv: list[str] | None = None) -> int:
         raise AssertionError(args.publish_job)
 
     if args.command == "run":
-        if event_source == "envio":
-            raise ValueError(
-                "The combined Envio run is disabled until discovery parity passes; "
-                "run discover and index-events separately for benchmarking"
-            )
         chains = _chains(args.chains)
-        count = discover(conn, chains, find_deployment=args.find_deployment)
-        print(f"discovered/upserted {count} vault rows")
-        if args.job == "lifetime-yield":
-            count = index_all_reports(
+        if args.job == "lifetime-yield" and event_source == "envio":
+            count = discover_from_envio(
                 conn,
                 chains,
                 to_block=args.to_block,
-                chunk_size=args.chunk_size,
                 progress=progress,
             )
+        else:
+            count = discover(conn, chains, find_deployment=args.find_deployment)
+        print(f"discovered/upserted {count} vault rows")
+        if args.job == "lifetime-yield":
+            if event_source == "envio":
+                count = import_reports_from_envio(
+                    conn,
+                    chains,
+                    to_block=args.to_block,
+                    progress=progress,
+                )
+            else:
+                count = index_all_reports(
+                    conn,
+                    chains,
+                    to_block=args.to_block,
+                    chunk_size=args.chunk_size,
+                    progress=progress,
+                )
             print(f"indexed {count} strategy report logs")
         else:
             count = index_all_volume(conn, chains, to_block=args.to_block, chunk_size=args.chunk_size, progress=progress)

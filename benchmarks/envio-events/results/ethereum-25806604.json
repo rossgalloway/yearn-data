@@ -25,5 +25,19 @@
     "normalized_rows_changed": 0,
     "raw_extra_json_changed": 2747
   },
-  "conclusion": "Pass: native Envio discovery and report indexing both have exact fixed-block parity with RPC."
+  "incremental_check": {
+    "from_block": 25806604,
+    "to_block": 25826895,
+    "new_reports": 81,
+    "immediate_rerun_reports": 0,
+    "status": "pass"
+  },
+  "cross_chain_discovery": {
+    "polygon": {"rpc": 7, "envio": 0},
+    "base": {"rpc": 8, "envio": 0},
+    "arbitrum": {"rpc": 6, "envio": 0},
+    "katana": {"rpc": 8, "envio": 0},
+    "status": "pending yearn-envio PR 51 deployment and reindex"
+  },
+  "conclusion": "Ethereum passes native discovery, report, and incremental parity. Cross-chain cutover awaits static role-manager indexing and revalidation."
 }
