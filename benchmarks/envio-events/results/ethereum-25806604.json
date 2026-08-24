@@ -2,23 +2,28 @@
   "block": 25806604,
   "discovery": {
     "rpc_seconds": 87.11,
+    "envio_seconds": 89.50,
+    "envio_max_rss_kb": 68352,
     "rpc_vaults": {"v2": 367, "v3": 37},
     "envio_selected_membership": {"v2": 367, "v3": 37},
     "envio_historical_inventory_distinct": {"v2": 452, "v3": 321},
     "v3_lifecycle_events": {"added": 74, "removed": 37},
-    "status": "address parity proven from production V2 filters and V3 lifecycle replay; live Envio rerun pending PR deployment and reindex"
+    "shared_addresses": 404,
+    "rpc_only_addresses": 0,
+    "envio_only_addresses": 0,
+    "status": "pass: live Envio discovery has exact fixed-block address and version parity with RPC"
   },
   "report_indexing": {
     "rpc_seconds": 347.26,
-    "envio_seconds": 55.87,
-    "speedup": 6.22,
+    "envio_seconds": 56.54,
+    "speedup": 6.14,
     "rpc_max_rss_kb": 85444,
-    "envio_max_rss_kb": 82032,
+    "envio_max_rss_kb": 82100,
     "reports": {"total": 39443, "v2": 32241, "v3": 7202},
     "rpc_only_keys": 0,
     "envio_only_keys": 0,
     "normalized_rows_changed": 0,
     "raw_extra_json_changed": 2747
   },
-  "conclusion": "Report indexing passes. Discovery rules now reproduce the fixed-block RPC membership; live Envio validation is pending the removal-event deployment and reindex."
+  "conclusion": "Pass: native Envio discovery and report indexing both have exact fixed-block parity with RPC."
 }

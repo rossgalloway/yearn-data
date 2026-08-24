@@ -486,6 +486,16 @@ def test_envio_discovery_excludes_experimental_v2_by_default(tmp_path, monkeypat
             log_index=index,
             tx_hash="0x" + f"{index:02x}" * 32,
         )
+    _seed_inventory(
+        conn,
+        version="v2",
+        vault=registry_vault,
+        source_kind="registry",
+        source_address="0x" + "7" * 40,
+        block=10,
+        log_index=10,
+        tx_hash="0x" + "10" * 32,
+    )
     monkeypatch.setattr(envio, "_import_v3_vault_inventory", lambda *args: 0)
     monkeypatch.setattr(envio, "_import_v2_vault_inventory", lambda *args: 0)
     monkeypatch.setattr(
@@ -505,6 +515,11 @@ def test_envio_discovery_excludes_experimental_v2_by_default(tmp_path, monkeypat
 
     assert envio.discover_from_envio(conn, ["eth"], to_block=100) == 2
     assert conn.execute("SELECT COUNT(*) FROM vaults WHERE version='v2' AND active=1").fetchone()[0] == 2
+    production_row = conn.execute(
+        "SELECT source_address, deployment_block FROM vaults WHERE address=?",
+        (registry_vault,),
+    ).fetchone()
+    assert tuple(production_row) == (V2_ETH_REGISTRIES[0], 21)
 
     assert envio.discover_from_envio(
         conn, ["eth"], include_experimental_v2=True, to_block=100

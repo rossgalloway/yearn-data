@@ -45,8 +45,7 @@ the two `index-events` commands with the same measurement tool.
 ## Current result
 
 The first Ethereum run is recorded in `results/ethereum-25806604.json` and the HTML report.
-The report import has full key and normalized-field parity. The corrected discovery
-rules reproduce the RPC membership counts and addresses from the indexed lifecycle:
-367 V2 production vaults, plus 37 V3 vaults active after 74 additions and 37 removals.
-The live Envio discovery rerun remains pending until the role-manager removal PR is
-deployed and the indexer has rebuilt its historical data.
+The live rerun passes both stages. Native Envio discovery reproduces all 404 RPC
+membership addresses: 367 V2 production vaults, plus 37 V3 vaults active after
+74 additions and 37 removals. Starting from that independently discovered database,
+Envio imports the same 39,443 report keys with no normalized accounting differences.

@@ -7,5 +7,5 @@
   "event_versions": ["v2", "v3"],
   "pricing_included": false,
   "tokenized_strategies_included": false,
-  "vault_scope": "404 vault rows discovered by main and copied to both event databases"
+  "vault_scope": "404 active vault addresses independently discovered by RPC and Envio"
 }

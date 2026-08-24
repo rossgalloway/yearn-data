@@ -915,16 +915,25 @@ def _inventory_facts(
     chain_id: int,
     version: str,
     max_block: int | None = None,
+    source_kinds: tuple[str, ...] | None = None,
+    source_addresses: tuple[str, ...] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    block_filter = " AND block_number<=?" if max_block is not None else ""
-    params: tuple[Any, ...] = (
-        (chain_id, version, max_block) if max_block is not None else (chain_id, version)
-    )
+    filters = ["chain_id=?", "version=?"]
+    params: list[Any] = [chain_id, version]
+    if max_block is not None:
+        filters.append("block_number<=?")
+        params.append(max_block)
+    if source_kinds:
+        filters.append(f"source_kind IN ({','.join('?' for _ in source_kinds)})")
+        params.extend(source_kinds)
+    if source_addresses:
+        filters.append(f"lower(source_address) IN ({','.join('?' for _ in source_addresses)})")
+        params.extend(address.lower() for address in source_addresses)
     rows = conn.execute(
         f"""
         SELECT *
         FROM vault_inventory_events
-        WHERE chain_id=? AND version=?{block_filter}
+        WHERE {' AND '.join(filters)}
         ORDER BY block_number, log_index
         """,
         params,
@@ -989,11 +998,20 @@ def _build_envio_vault_records(
     addresses: list[str],
     source_address_override: str | None = None,
     max_block: int | None = None,
+    inventory_source_kinds: tuple[str, ...] | None = None,
+    inventory_source_addresses: tuple[str, ...] | None = None,
 ) -> list[VaultRecord]:
     """Reuse cached metadata; resolve only missing records through Yearn Kong."""
     cfg = CHAINS[chain]
     existing = _existing_vaults(conn, cfg.chain_id)
-    inventory = _inventory_facts(conn, cfg.chain_id, version, max_block=max_block)
+    inventory = _inventory_facts(
+        conn,
+        cfg.chain_id,
+        version,
+        max_block=max_block,
+        source_kinds=inventory_source_kinds,
+        source_addresses=inventory_source_addresses,
+    )
     normalized = [Web3.to_checksum_address(address) for address in addresses]
     metadata_targets = [
         address
@@ -1181,7 +1199,13 @@ def discover_from_envio(
         )
         records.extend(
             _build_envio_vault_records(
-                conn, chain, "v2", sorted(v2_addresses), max_block=hi
+                conn,
+                chain,
+                "v2",
+                sorted(v2_addresses),
+                max_block=hi,
+                inventory_source_kinds=v2_source_kinds,
+                inventory_source_addresses=V2_ETH_REGISTRIES,
             )
         )
         total += _upsert_envio_vaults(conn, records)

@@ -32,7 +32,7 @@
   <div class="grid">
     <div class="metric"><span class="value">39,443</span><span class="label">MATCHING REPORT KEYS</span></div>
     <div class="metric"><span class="value">0</span><span class="label">NORMALIZED ROW CHANGES</span></div>
-    <div class="metric"><span class="value">6.22×</span><span class="label">ENVIO SPEEDUP</span></div>
+    <div class="metric"><span class="value">6.14×</span><span class="label">ENVIO SPEEDUP</span></div>
   </div>
 
   <h2>Report indexing</h2>
@@ -40,7 +40,7 @@
     <thead><tr><th>Source</th><th>Time</th><th>Max RSS</th><th>V2</th><th>V3</th></tr></thead>
     <tbody>
       <tr><td>RPC baseline</td><td>347.26 s</td><td>85,444 KB</td><td>32,241</td><td>7,202</td></tr>
-      <tr><td>Envio candidate</td><td>55.87 s</td><td>82,032 KB</td><td>32,241</td><td>7,202</td></tr>
+      <tr><td>Envio candidate</td><td>56.54 s</td><td>82,100 KB</td><td>32,241</td><td>7,202</td></tr>
     </tbody>
   </table>
   <p class="pass">Pass: no RPC-only keys, no Envio-only keys, and no differences in normalized accounting fields.</p>
@@ -48,15 +48,15 @@
 
   <h2>Discovery finding</h2>
   <table>
-    <thead><tr><th>Inventory</th><th>V2</th><th>V3</th></tr></thead>
+    <thead><tr><th>Inventory</th><th>Time</th><th>V2</th><th>V3</th></tr></thead>
     <tbody>
-      <tr><td>Main current RPC discovery</td><td>367</td><td>37</td></tr>
-      <tr><td>Envio selected membership</td><td>367</td><td>37</td></tr>
-      <tr><td>Envio full audit inventory</td><td>452</td><td>321</td></tr>
+      <tr><td>Main current RPC discovery</td><td>87.11 s</td><td>367</td><td>37</td></tr>
+      <tr><td>Envio selected membership</td><td>89.50 s</td><td>367</td><td>37</td></tr>
+      <tr><td>Envio full audit inventory</td><td>—</td><td>452</td><td>321</td></tr>
     </tbody>
   </table>
-  <p class="pass">Resolved in code: V2 selects production registry events by default. V3 replays 74 role-manager additions and 37 removals in block/log order, leaving the same 37 active addresses as RPC discovery.</p>
-  <p>Live Envio discovery validation is pending deployment of the role-manager removal indexer PR and a historical reindex. Until then, this membership result is proven from the exact RPC lifecycle event set at the benchmark block.</p>
+  <p class="pass">Live pass: all 404 active addresses match, with no RPC-only or Envio-only vaults. V2 selects production registry events by default. V3 replays 74 role-manager additions and 37 removals in block/log order, leaving the same 37 active addresses as RPC discovery.</p>
+  <p>The full report import was run from this independently discovered Envio database. Its 39,443 report keys and every normalized accounting field match the RPC baseline.</p>
 
   <h2>Scope</h2>
   <p>Pricing and tokenized strategies were intentionally excluded. Both report runs used the same 404 main-discovered vault rows and the same per-vault start blocks.</p>
