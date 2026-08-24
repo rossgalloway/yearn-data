@@ -85,6 +85,7 @@ def run_lifetime_yield(conn) -> int:
             ORDER BY CASE p2.source WHEN 'defillama' THEN 0 ELSE 1 END
             LIMIT 1
          )
+        WHERE v.active=1
         """
     ).fetchall()
 
@@ -348,6 +349,7 @@ def run_vault_fees(conn) -> int:
           ON v.chain_id = r.chain_id AND v.address = r.vault_address
         {_selected_report_price_join("r")}
         WHERE r.version='v3'
+          AND v.active=1
           AND (
             CAST(COALESCE(r.protocol_fees_raw, '0') AS INTEGER) > 0
             OR CAST(COALESCE(r.total_fees_raw, '0') AS INTEGER) > 0
@@ -410,6 +412,7 @@ def run_vault_fees(conn) -> int:
           ON v.chain_id = fe.chain_id AND v.address = fe.vault_address
         {_selected_report_price_join("fe")}
         WHERE fe.version='v2'
+          AND v.active=1
           AND CAST(fe.fee_raw AS INTEGER) > 0
         ORDER BY fe.chain_id, fe.block_number, fe.log_index
         """
@@ -565,6 +568,7 @@ def run_vault_volume(conn) -> int:
         LEFT JOIN vaults v
           ON v.chain_id = vf.chain_id AND v.address = vf.vault_address
         {_selected_price_join("vf")}
+        WHERE v.active=1
         ORDER BY vf.chain_id, vf.block_number, vf.log_index
         """
     ).fetchall()
@@ -610,6 +614,7 @@ def run_vault_volume(conn) -> int:
         LEFT JOIN vaults v
           ON v.chain_id = sdf.chain_id AND v.address = sdf.vault_address
         {_selected_price_join("sdf")}
+        WHERE v.active=1
         ORDER BY sdf.chain_id, sdf.block_number, sdf.log_index, sdf.direction
         """
     ).fetchall()

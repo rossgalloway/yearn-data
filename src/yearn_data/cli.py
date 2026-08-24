@@ -7,8 +7,9 @@ import os
 from pathlib import Path
 
 from .analysis import run_lifetime_yield, run_vault_fees, run_vault_volume
-from .config import CHAINS, load_environment, normalize_chain_key
+from .config import CHAINS, get_event_source, load_environment, normalize_chain_key
 from .discovery import discover
+from .envio import discover_from_envio, import_reports_from_envio
 from .exports import export_analysis
 from .headline import LIFETIME_YIELD_HEADLINE_KEY, publish_lifetime_yield_headline
 from .indexing import index_all_reports, index_all_volume, index_v2_fee_mints_from_reports
@@ -67,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-v2",
         action="store_true",
         help="Skip Ethereum V2 registry discovery when refreshing V3-only vault sets.",
+    )
+    discover_p.add_argument("--to-block", type=int, help="Stop Envio inventory discovery at this block")
+    discover_p.add_argument(
+        "--include-experimental-v2",
+        action="store_true",
+        help="Include V2 experimental registry deployments (excluded by default for RPC parity).",
     )
 
     index_p = sub.add_parser("index-events")
@@ -132,35 +139,61 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     load_environment(args.env)
     conn = open_db(args.db)
+    event_source = get_event_source()
 
     if args.command == "init-db":
         print(f"initialized {args.db}")
         return 0
 
     if args.command == "discover":
-        count = discover(
-            conn,
-            _chains(args.chains),
-            find_deployment=args.find_deployment,
-            include_non_yearn=args.include_non_yearn,
-            skip_v2=args.skip_v2,
-        )
+        if event_source == "envio":
+            if args.include_non_yearn:
+                raise ValueError("--include-non-yearn is only available with YEARN_DATA_EVENT_SOURCE=rpc")
+            count = discover_from_envio(
+                conn,
+                _chains(args.chains),
+                skip_v2=args.skip_v2,
+                include_experimental_v2=args.include_experimental_v2,
+                to_block=args.to_block,
+                progress=progress,
+            )
+        else:
+            if args.include_experimental_v2:
+                raise ValueError("--include-experimental-v2 is only available with YEARN_DATA_EVENT_SOURCE=envio")
+            count = discover(
+                conn,
+                _chains(args.chains),
+                find_deployment=args.find_deployment,
+                include_non_yearn=args.include_non_yearn,
+                skip_v2=args.skip_v2,
+            )
         print(f"discovered/upserted {count} vault rows")
         return 0
 
     if args.command == "index-events":
-        count = index_all_reports(
-            conn,
-            _chains(args.chains),
-            versions=args.versions,
-            to_block=args.to_block,
-            chunk_size=args.chunk_size,
-            progress=progress,
-        )
+        if event_source == "envio":
+            count = import_reports_from_envio(
+                conn,
+                _chains(args.chains),
+                versions=args.versions,
+                to_block=args.to_block,
+                progress=progress,
+            )
+        else:
+            count = index_all_reports(
+                conn,
+                _chains(args.chains),
+                versions=args.versions,
+                to_block=args.to_block,
+                chunk_size=args.chunk_size,
+                progress=progress,
+            )
         print(f"indexed {count} strategy report logs")
         return 0
 
     if args.command == "index-volume":
+        if event_source == "envio":
+            raise ValueError("Envio volume indexing is outside the initial report-event benchmark")
         count = index_all_volume(
             conn,
             _chains(args.chains),
@@ -173,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "index-fees":
+        if event_source == "envio":
+            raise ValueError("Envio fee indexing is outside the initial report-event benchmark")
         count = index_v2_fee_mints_from_reports(conn, _chains(args.chains), progress=progress)
         print(f"indexed {count} fee events")
         return 0
@@ -232,11 +267,22 @@ def main(argv: list[str] | None = None) -> int:
         raise AssertionError(args.publish_job)
 
     if args.command == "run":
+        if event_source == "envio":
+            raise ValueError(
+                "The combined Envio run is disabled until discovery parity passes; "
+                "run discover and index-events separately for benchmarking"
+            )
         chains = _chains(args.chains)
         count = discover(conn, chains, find_deployment=args.find_deployment)
         print(f"discovered/upserted {count} vault rows")
         if args.job == "lifetime-yield":
-            count = index_all_reports(conn, chains, to_block=args.to_block, chunk_size=args.chunk_size, progress=progress)
+            count = index_all_reports(
+                conn,
+                chains,
+                to_block=args.to_block,
+                chunk_size=args.chunk_size,
+                progress=progress,
+            )
             print(f"indexed {count} strategy report logs")
         else:
             count = index_all_volume(conn, chains, to_block=args.to_block, chunk_size=args.chunk_size, progress=progress)

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Yearn data — Envio event benchmark</title>
+  <style>
+    :root { color-scheme: light; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #171717; background: #f5f5f2; }
+    body { max-width: 980px; margin: 0 auto; padding: 64px 24px 96px; }
+    h1 { font: 600 38px/1.1 system-ui, sans-serif; letter-spacing: -.04em; margin: 0 0 12px; }
+    h2 { font: 600 20px/1.2 system-ui, sans-serif; margin: 48px 0 16px; }
+    p { line-height: 1.65; max-width: 760px; color: #454545; }
+    .meta { color: #737373; margin-bottom: 40px; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid #c8c8c3; background: white; }
+    .metric { padding: 24px; border-right: 1px solid #deded9; }
+    .metric:last-child { border: 0; }
+    .value { display: block; font: 650 32px/1 system-ui, sans-serif; letter-spacing: -.04em; }
+    .label { display: block; margin-top: 10px; color: #666; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid #c8c8c3; }
+    th, td { padding: 14px 16px; text-align: left; border-bottom: 1px solid #deded9; }
+    th { color: #666; font-weight: 500; font-size: 12px; }
+    td:nth-child(n+2), th:nth-child(n+2) { text-align: right; }
+    .pass, .blocker { padding: 16px 18px; background: white; border-left: 4px solid #171717; }
+    .blocker { border-left-style: double; }
+    code { color: #171717; }
+    @media (max-width: 680px) { .grid { grid-template-columns: 1fr; } .metric { border-right: 0; border-bottom: 1px solid #deded9; } }
+  </style>
+</head>
+<body>
+  <h1>Envio event benchmark</h1>
+  <p class="meta">Ethereum · fixed block 25,806,604 · main <code>1c0fc4b</code></p>
+  <div class="grid">
+    <div class="metric"><span class="value">39,443</span><span class="label">MATCHING REPORT KEYS</span></div>
+    <div class="metric"><span class="value">0</span><span class="label">NORMALIZED ROW CHANGES</span></div>
+    <div class="metric"><span class="value">6.22×</span><span class="label">ENVIO SPEEDUP</span></div>
+  </div>
+
+  <h2>Report indexing</h2>
+  <table>
+    <thead><tr><th>Source</th><th>Time</th><th>Max RSS</th><th>V2</th><th>V3</th></tr></thead>
+    <tbody>
+      <tr><td>RPC baseline</td><td>347.26 s</td><td>85,444 KB</td><td>32,241</td><td>7,202</td></tr>
+      <tr><td>Envio candidate</td><td>55.87 s</td><td>82,032 KB</td><td>32,241</td><td>7,202</td></tr>
+    </tbody>
+  </table>
+  <p class="pass">Pass: no RPC-only keys, no Envio-only keys, and no differences in normalized accounting fields.</p>
+  <p>There are 2,747 raw JSON differences for older V2 reports. Envio writes <code>debtPaid: 0</code>; RPC omits the field because that older event signature did not include it. The normalized database values are equal.</p>
+
+  <h2>Discovery finding</h2>
+  <table>
+    <thead><tr><th>Inventory</th><th>V2</th><th>V3</th></tr></thead>
+    <tbody>
+      <tr><td>Main current RPC discovery</td><td>367</td><td>37</td></tr>
+      <tr><td>Envio selected membership</td><td>367</td><td>37</td></tr>
+      <tr><td>Envio full audit inventory</td><td>452</td><td>321</td></tr>
+    </tbody>
+  </table>
+  <p class="pass">Resolved in code: V2 selects production registry events by default. V3 replays 74 role-manager additions and 37 removals in block/log order, leaving the same 37 active addresses as RPC discovery.</p>
+  <p>Live Envio discovery validation is pending deployment of the role-manager removal indexer PR and a historical reindex. Until then, this membership result is proven from the exact RPC lifecycle event set at the benchmark block.</p>
+
+  <h2>Scope</h2>
+  <p>Pricing and tokenized strategies were intentionally excluded. Both report runs used the same 404 main-discovered vault rows and the same per-vault start blocks.</p>
+</body>
+</html>

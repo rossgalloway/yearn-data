@@ -32,10 +32,31 @@ ETHERSCAN_API_KEY=
 
 `ETHERSCAN_API_KEY` is optional for most indexing runs, but useful for V2 source/ABI review workflows.
 
+### Event source
+
+Envio is the default event source. Set its GraphQL URL before discovery or event
+indexing:
+
+```bash
+YEARN_ENVIO_GRAPHQL_URL=
+YEARN_DATA_EVENT_SOURCE=envio
+```
+
+Envio discovery stores the complete vault event history in SQLite, then selects
+the Yearn membership at the requested block. V3 membership is replayed in log
+order from role-manager add/remove events. V2 production registry events are
+selected by default; pass `discover --include-experimental-v2` to include V2
+experimental deployments as well.
+
+Use `YEARN_DATA_EVENT_SOURCE=rpc` for the legacy RPC path or for a baseline
+benchmark.
+
 ## Useful Options
 
 ```bash
 yearn-data --db data/yearn.sqlite discover --chains eth arb kat
+yearn-data discover --chains eth --to-block 25806604
+yearn-data discover --chains eth --include-experimental-v2
 yearn-data index-events --to-block 25400000 --chunk-size 5000
 yearn-data run lifetime-yield
 yearn-data run vault-volume

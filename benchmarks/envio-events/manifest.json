@@ -1,0 +1,11 @@
+{
+  "chain": "eth",
+  "chain_id": 1,
+  "fixed_block": 25806604,
+  "main_commit": "1c0fc4b",
+  "candidate_branch": "codex/envio-event-benchmark",
+  "event_versions": ["v2", "v3"],
+  "pricing_included": false,
+  "tokenized_strategies_included": false,
+  "vault_scope": "404 vault rows discovered by main and copied to both event databases"
+}

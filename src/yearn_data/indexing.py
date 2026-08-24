@@ -539,7 +539,7 @@ def _cached_vault_share_prices_many(
     chain: str,
     vaults_by_address: dict[str, Any],
     logs: list[dict[str, Any]],
-    max_workers: int = 16,
+    share_decimals_by_address: dict[str, int] | None = None,
 ) -> dict[tuple[str, int], tuple[int, int]]:
     cfg = CHAINS[chain]
     keys = sorted(
@@ -578,9 +578,14 @@ def _cached_vault_share_prices_many(
     if not missing:
         return found
 
+    metadata_share_decimals = share_decimals_by_address or {}
+    missing_decimals = sorted({address for address, _ in missing} - set(metadata_share_decimals))
     share_decimals_by_address = {
-        address: _vault_share_decimals(chain, address, vaults_by_address[address]["asset_decimals"])
-        for address in sorted({address for address, _ in missing})
+        **metadata_share_decimals,
+        **{
+            address: _vault_share_decimals(chain, address, vaults_by_address[address]["asset_decimals"])
+            for address in missing_decimals
+        },
     }
     fetched: list[tuple[str, int, int, int, str]] = []
     for address, block, price_per_share, source in _fetch_vault_price_per_share_many(chain, missing):

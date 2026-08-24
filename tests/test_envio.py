@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from yearn_data import envio
-from yearn_data.config import CHAINS
+from yearn_data.config import CHAINS, V2_ETH_REGISTRIES, V3_ROLE_MANAGERS
 from yearn_data.indexing import insert_strategy_report, normalize_strategy_report
 from yearn_data.storage import connect, init_db, seed_chains
 
@@ -228,56 +230,78 @@ def test_v2_fee_import_uses_envio_transfers_and_batched_archive_pps(tmp_path, mo
 
 
 
-def test_cli_index_fees_uses_envio_by_default(tmp_path, monkeypatch):
+def test_cli_index_fees_is_disabled_for_envio_during_initial_benchmark(tmp_path, monkeypatch):
     from yearn_data import cli
 
     conn = _db(tmp_path)
-    calls: list[tuple] = []
     monkeypatch.delenv("YEARN_DATA_EVENT_SOURCE", raising=False)
     monkeypatch.setattr(cli, "open_db", lambda _path: conn)
-    monkeypatch.setattr(
-        cli,
-        "index_v2_fee_mints_from_envio",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or 1,
-    )
-    monkeypatch.setattr(
-        cli,
-        "index_v2_fee_mints_from_reports",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected RPC receipt path")),
-    )
 
-    assert cli.main(["--db", str(tmp_path / "unused.sqlite"), "index-fees", "--chains", "eth"]) == 0
-    assert len(calls) == 1
+    with pytest.raises(ValueError, match="outside the initial report-event benchmark"):
+        cli.main(["--db", str(tmp_path / "unused.sqlite"), "index-fees", "--chains", "eth"])
 
-def test_report_import_skips_vaults_missing_from_yearn_metadata(tmp_path, monkeypatch):
+def test_report_import_stops_before_advancing_for_an_unclassified_vault(tmp_path, monkeypatch):
     conn = _db(tmp_path)
     monkeypatch.setattr(envio, "_pull_window", lambda *args, **kwargs: [_v3_report_node()])
     monkeypatch.setattr(envio, "_window_blocks", lambda: 1_000_000)
 
-    assert envio.import_reports_from_envio(conn, ["eth"], versions=["v3"], to_block=100) == 0
+    with pytest.raises(RuntimeError, match="unclassified vault"):
+        envio.import_reports_from_envio(conn, ["eth"], versions=["v3"], to_block=100)
     assert conn.execute("SELECT COUNT(*) FROM strategy_reports").fetchone()[0] == 0
+    assert envio._get_envio_cursor(conn, 1, "StrategyReported") is None
+
+
+def _seed_inventory(
+    conn,
+    *,
+    version="v3",
+    vault=VAULT,
+    asset=ASSET,
+    source_kind="role_manager",
+    source_address=V3_ROLE_MANAGERS[1],
+    action="added",
+    block=40,
+    log_index=1,
+    tx_hash=TX,
+):
+    conn.execute(
+        """
+        INSERT INTO vault_inventory_events (
+            chain_id, version, vault_address, source_kind, source_address,
+            action, asset, tx_hash, log_index, block_number, block_timestamp
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1700000000)
+        """,
+        (
+            version,
+            vault,
+            source_kind,
+            source_address,
+            action,
+            asset,
+            tx_hash,
+            log_index,
+            block,
+        ),
+    )
+    conn.commit()
+
+
 def test_envio_discovery_reuses_cached_metadata_and_preserves_rpc_facts(tmp_path, monkeypatch):
     conn = _db(tmp_path)
     _seed_vault(conn)
-    monkeypatch.setattr(
-        envio,
-        "_distinct_vault_addresses",
-        lambda _chain_id, entities: {VAULT} if entities == envio.V3_DISCOVERY_ENTITIES else {"0x" + "4" * 40},
-    )
+    _seed_inventory(conn)
+    monkeypatch.setattr(envio, "_import_v3_vault_inventory", lambda *args: 0)
     monkeypatch.setattr(envio, "vault_metadata_from_kong", lambda *args: (_ for _ in ()).throw(AssertionError("unexpected Kong query")))
 
-    assert envio.discover_from_envio(conn, ["eth"], skip_v2=True) == 1
+    assert envio.discover_from_envio(conn, ["eth"], skip_v2=True, to_block=100) == 1
     row = conn.execute("SELECT source_address, deployment_block, asset, management FROM vaults WHERE address=?", (VAULT,)).fetchone()
     assert tuple(row) == ("0xsource", 42, ASSET, "yearn")
 
 
 def test_envio_discovery_resolves_missing_asset_decimals_from_kong(tmp_path, monkeypatch):
     conn = _db(tmp_path)
-    monkeypatch.setattr(
-        envio,
-        "_distinct_vault_addresses",
-        lambda _chain_id, entities: {VAULT} if entities == envio.V3_DISCOVERY_ENTITIES else set(),
-    )
+    _seed_inventory(conn)
+    monkeypatch.setattr(envio, "_import_v3_vault_inventory", lambda *args: 0)
     monkeypatch.setattr(
         envio,
         "vault_metadata_from_kong",
@@ -292,40 +316,246 @@ def test_envio_discovery_resolves_missing_asset_decimals_from_kong(tmp_path, mon
         },
     )
 
-    assert envio.discover_from_envio(conn, ["eth"], skip_v2=True) == 1
+    assert envio.discover_from_envio(conn, ["eth"], skip_v2=True, to_block=100) == 1
     row = conn.execute("SELECT asset, asset_symbol, asset_decimals FROM vaults WHERE address=?", (VAULT,)).fetchone()
     assert tuple(row) == (ASSET, "USDC", 6)
 
 
+def test_v3_inventory_keeps_each_classification_source(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    nodes_by_entity = {
+        "V3RegistryNewEndorsedVault": [{
+            "registryAddress": "0x" + "5" * 40,
+            "vault": VAULT,
+            "asset": ASSET,
+            "releaseVersion": "3",
+            "vaultType": "0",
+            "chainId": 1,
+            "blockNumber": 40,
+            "blockTimestamp": 1_700_000_000,
+            "transactionHash": TX,
+            "logIndex": 1,
+        }],
+        "V3VaultFactoryNewVault": [{
+            "factoryAddress": "0x" + "6" * 40,
+            "vault_address": VAULT,
+            "asset": ASSET,
+            "chainId": 1,
+            "blockNumber": 41,
+            "blockTimestamp": 1_700_000_001,
+            "transactionHash": "0x" + "bc" * 32,
+            "logIndex": 2,
+        }],
+        "V3RoleManagerAddedNewVault": [{
+            "roleManagerAddress": "0x" + "7" * 40,
+            "vault": VAULT,
+            "debtAllocator": "0x" + "8" * 40,
+            "category": "0",
+            "chainId": 1,
+            "blockNumber": 42,
+            "blockTimestamp": 1_700_000_002,
+            "transactionHash": "0x" + "cd" * 32,
+            "logIndex": 3,
+        }],
+        "V3RoleManagerRemovedVault": [{
+            "roleManagerAddress": "0x" + "7" * 40,
+            "vault": VAULT,
+            "chainId": 1,
+            "blockNumber": 43,
+            "blockTimestamp": 1_700_000_003,
+            "transactionHash": "0x" + "de" * 32,
+            "logIndex": 4,
+        }],
+    }
+    monkeypatch.setattr(
+        envio,
+        "_pull_window",
+        lambda entity, *args, **kwargs: nodes_by_entity[entity],
+    )
 
-def test_cli_run_lifetime_yield_uses_envio_by_default(tmp_path, monkeypatch):
+    assert envio._import_v3_vault_inventory(conn, "eth", 100, None) == 4
+    rows = conn.execute(
+        "SELECT source_kind, action FROM vault_inventory_events ORDER BY block_number"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("registry", "added"),
+        ("factory", "added"),
+        ("role_manager", "added"),
+        ("role_manager", "removed"),
+    ]
+
+
+def test_v3_membership_replays_add_remove_and_readd_at_selected_block(tmp_path):
+    conn = _db(tmp_path)
+    removed_vault = "0x" + "4" * 40
+    later_vault = "0x" + "5" * 40
+    _seed_inventory(conn, vault=VAULT, block=10, log_index=1, tx_hash="0x" + "10" * 32)
+    _seed_inventory(conn, vault=removed_vault, block=11, log_index=1, tx_hash="0x" + "11" * 32)
+    _seed_inventory(
+        conn,
+        vault=VAULT,
+        action="removed",
+        asset=None,
+        block=12,
+        log_index=1,
+        tx_hash="0x" + "12" * 32,
+    )
+    _seed_inventory(
+        conn,
+        vault=removed_vault,
+        action="removed",
+        asset=None,
+        block=13,
+        log_index=1,
+        tx_hash="0x" + "13" * 32,
+    )
+    _seed_inventory(conn, vault=VAULT, block=14, log_index=1, tx_hash="0x" + "14" * 32)
+    _seed_inventory(conn, vault=later_vault, block=101, log_index=1, tx_hash="0x" + "15" * 32)
+
+    assert envio._active_v3_role_manager_addresses(
+        conn, 1, V3_ROLE_MANAGERS[1], 100
+    ) == {VAULT}
+
+
+def test_envio_discovery_marks_removed_v3_vaults_inactive(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    removed_vault = "0x" + "4" * 40
+    _seed_vault(conn)
+    conn.execute(
+        """
+        INSERT INTO vaults (
+            chain_id, version, address, source_address, asset, asset_symbol,
+            asset_decimals, name, api_version, deployment_block, updated_at
+        ) VALUES (1, 'v3', ?, '0xsource', ?, 'USDC', 6, 'removed', '3.0.0', 43, 1)
+        """,
+        (removed_vault, ASSET),
+    )
+    conn.commit()
+    _seed_inventory(conn, vault=VAULT, block=40, log_index=1, tx_hash="0x" + "20" * 32)
+    _seed_inventory(
+        conn,
+        vault=removed_vault,
+        block=41,
+        log_index=1,
+        tx_hash="0x" + "21" * 32,
+    )
+    _seed_inventory(
+        conn,
+        vault=removed_vault,
+        asset=None,
+        action="removed",
+        block=42,
+        log_index=1,
+        tx_hash="0x" + "22" * 32,
+    )
+    monkeypatch.setattr(envio, "_import_v3_vault_inventory", lambda *args: 0)
+    monkeypatch.setattr(
+        envio,
+        "vault_metadata_from_kong",
+        lambda *args: (_ for _ in ()).throw(AssertionError("unexpected Kong query")),
+    )
+
+    assert envio.discover_from_envio(conn, ["eth"], skip_v2=True, to_block=100) == 1
+    rows = conn.execute("SELECT address, active FROM vaults ORDER BY address").fetchall()
+    assert {row["address"]: row["active"] for row in rows} == {
+        VAULT: 1,
+        removed_vault: 0,
+    }
+
+
+def test_envio_discovery_excludes_experimental_v2_by_default(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    registry_vault = "0x" + "4" * 40
+    registry2_vault = "0x" + "5" * 40
+    experimental_vault = "0x" + "6" * 40
+    for index, (vault, source_kind) in enumerate(
+        (
+            (registry_vault, "registry"),
+            (registry2_vault, "registry2"),
+            (experimental_vault, "registry_experimental"),
+        ),
+        start=1,
+    ):
+        _seed_inventory(
+            conn,
+            version="v2",
+            vault=vault,
+            source_kind=source_kind,
+            source_address=V2_ETH_REGISTRIES[0],
+            block=20 + index,
+            log_index=index,
+            tx_hash="0x" + f"{index:02x}" * 32,
+        )
+    monkeypatch.setattr(envio, "_import_v3_vault_inventory", lambda *args: 0)
+    monkeypatch.setattr(envio, "_import_v2_vault_inventory", lambda *args: 0)
+    monkeypatch.setattr(
+        envio,
+        "vault_metadata_from_kong",
+        lambda _chain_id, addresses: {
+            address: {
+                "asset": ASSET,
+                "asset_symbol": "USDC",
+                "asset_decimals": 6,
+                "name": "vault",
+                "api_version": "0.4.3",
+            }
+            for address in addresses
+        },
+    )
+
+    assert envio.discover_from_envio(conn, ["eth"], to_block=100) == 2
+    assert conn.execute("SELECT COUNT(*) FROM vaults WHERE version='v2' AND active=1").fetchone()[0] == 2
+
+    assert envio.discover_from_envio(
+        conn, ["eth"], include_experimental_v2=True, to_block=100
+    ) == 3
+    assert conn.execute("SELECT COUNT(*) FROM vaults WHERE version='v2' AND active=1").fetchone()[0] == 3
+
+
+def test_cli_routes_experimental_v2_option_to_envio_discovery(tmp_path, monkeypatch):
     from yearn_data import cli
 
     conn = _db(tmp_path)
-    calls: list[str] = []
+    captured = {}
+    monkeypatch.setenv("YEARN_DATA_EVENT_SOURCE", "envio")
+    monkeypatch.setattr(cli, "open_db", lambda _path: conn)
+
+    def fake_discover(*args, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "discover_from_envio", fake_discover)
+    assert cli.main(
+        [
+            "--db",
+            str(tmp_path / "unused.sqlite"),
+            "discover",
+            "--chains",
+            "eth",
+            "--include-experimental-v2",
+        ]
+    ) == 0
+    assert captured["include_experimental_v2"] is True
+
+
+
+def test_cli_combined_run_is_disabled_until_discovery_parity(tmp_path, monkeypatch):
+    from yearn_data import cli
+
+    conn = _db(tmp_path)
     monkeypatch.delenv("YEARN_DATA_EVENT_SOURCE", raising=False)
     monkeypatch.setattr(cli, "open_db", lambda _path: conn)
-    monkeypatch.setattr(
-        cli,
-        "discover_from_envio",
-        lambda *args, **kwargs: calls.append("discover") or 1,
-    )
-    monkeypatch.setattr(
-        cli,
-        "import_reports_from_envio",
-        lambda *args, **kwargs: calls.append("reports") or 2,
-    )
-    monkeypatch.setattr(
-        cli,
-        "price_unpriced_reports",
-        lambda *args, **kwargs: calls.append("price") or 3,
-    )
-    monkeypatch.setattr(
-        cli,
-        "_run_analysis",
-        lambda *args, **kwargs: calls.append("analyze") or 4,
-    )
-    monkeypatch.setattr(cli, "export_analysis", lambda *args, **kwargs: calls.append("export") or [])
 
-    assert cli.main(["--db", str(tmp_path / "unused.sqlite"), "run", "lifetime-yield", "--chains", "eth", "--to-block", "100"]) == 0
-    assert calls == ["discover", "reports", "price", "analyze", "export"]
+    with pytest.raises(ValueError, match="discovery parity"):
+        cli.main(
+            [
+                "--db",
+                str(tmp_path / "unused.sqlite"),
+                "run",
+                "lifetime-yield",
+                "--chains",
+                "eth",
+                "--to-block",
+                "100",
+            ]
+        )
