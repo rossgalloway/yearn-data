@@ -42,16 +42,8 @@ python scripts/compare_event_databases.py /tmp/rpc.sqlite /tmp/envio.sqlite \
 Load the same `.env` file for every command. Record wall time and peak memory for
 the two `index-events` commands with the same measurement tool.
 
-## Current result
+## Result handling
 
-The first Ethereum run is recorded in `results/ethereum-25806604.json` and the HTML report.
-The live rerun passes both stages. Native Envio discovery reproduces all 404 RPC
-membership addresses: 367 V2 production vaults, plus 37 V3 vaults active after
-74 additions and 37 removals. Starting from that independently discovered database,
-Envio imports the same 39,443 report keys with no normalized accounting differences.
-
-An Ethereum incremental run from block 25,806,604 to 25,826,895 imported 81 new
-reports, followed by zero on an immediate rerun. After
-[yearn-envio PR #51](https://github.com/yearn/yearn-envio/pull/51) was deployed and
-reindexed, cross-chain discovery also passed exact active address and version parity:
-7 Polygon, 8 Base, 6 Arbitrum, and 8 Katana vaults, with no source-only rows.
+Benchmark databases and generated results are not committed. Publish each completed
+benchmark as one review document and link it from the pull request that uses it as
+acceptance evidence.
