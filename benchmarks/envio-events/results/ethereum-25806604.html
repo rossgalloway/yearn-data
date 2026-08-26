@@ -65,13 +65,13 @@
   <table>
     <thead><tr><th>Chain</th><th>RPC active</th><th>Envio active</th></tr></thead>
     <tbody>
-      <tr><td>Polygon</td><td>7</td><td>0</td></tr>
-      <tr><td>Base</td><td>8</td><td>0</td></tr>
-      <tr><td>Arbitrum</td><td>6</td><td>0</td></tr>
-      <tr><td>Katana</td><td>8</td><td>0</td></tr>
+      <tr><td>Polygon</td><td>7</td><td>7</td></tr>
+      <tr><td>Base</td><td>8</td><td>8</td></tr>
+      <tr><td>Arbitrum</td><td>6</td><td>6</td></tr>
+      <tr><td>Katana</td><td>8</td><td>8</td></tr>
     </tbody>
   </table>
-  <p class="blocker">Pending: the configured role managers on these chains predate Envio's indexed factory path. <a href="https://github.com/yearn/yearn-envio/pull/51">yearn-envio PR #51</a> adds them statically. Cross-chain discovery must be rerun after deployment and historical reindex.</p>
+  <p class="pass">Pass after <a href="https://github.com/yearn/yearn-envio/pull/51">yearn-envio PR #51</a>: every active address and version matches, with no RPC-only or Envio-only vaults.</p>
 
   <h2>Scope</h2>
   <p>Pricing and tokenized strategies were intentionally excluded. Both report runs used the same 404 main-discovered vault rows and the same per-vault start blocks.</p>

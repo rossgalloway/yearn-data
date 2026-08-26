@@ -51,8 +51,7 @@ membership addresses: 367 V2 production vaults, plus 37 V3 vaults active after
 Envio imports the same 39,443 report keys with no normalized accounting differences.
 
 An Ethereum incremental run from block 25,806,604 to 25,826,895 imported 81 new
-reports, followed by zero on an immediate rerun. Cross-chain discovery found that
-the configured Polygon, Base, Arbitrum, and Katana role managers predate Envio's
-factory-discovery path. [yearn-envio PR #51](https://github.com/yearn/yearn-envio/pull/51)
-adds those four static registrations; cross-chain parity remains pending its
-deployment and historical reindex.
+reports, followed by zero on an immediate rerun. After
+[yearn-envio PR #51](https://github.com/yearn/yearn-envio/pull/51) was deployed and
+reindexed, cross-chain discovery also passed exact active address and version parity:
+7 Polygon, 8 Base, 6 Arbitrum, and 8 Katana vaults, with no source-only rows.

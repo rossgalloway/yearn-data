@@ -33,11 +33,11 @@
     "status": "pass"
   },
   "cross_chain_discovery": {
-    "polygon": {"rpc": 7, "envio": 0},
-    "base": {"rpc": 8, "envio": 0},
-    "arbitrum": {"rpc": 6, "envio": 0},
-    "katana": {"rpc": 8, "envio": 0},
-    "status": "pending yearn-envio PR 51 deployment and reindex"
+    "polygon": {"rpc": 7, "envio": 7, "rpc_only": 0, "envio_only": 0},
+    "base": {"rpc": 8, "envio": 8, "rpc_only": 0, "envio_only": 0},
+    "arbitrum": {"rpc": 6, "envio": 6, "rpc_only": 0, "envio_only": 0},
+    "katana": {"rpc": 8, "envio": 8, "rpc_only": 0, "envio_only": 0},
+    "status": "pass: exact active address and version parity after yearn-envio PR 51 reindex"
   },
-  "conclusion": "Ethereum passes native discovery, report, and incremental parity. Cross-chain cutover awaits static role-manager indexing and revalidation."
+  "conclusion": "Pass: Ethereum discovery, reports, and incremental indexing match RPC, and all configured cross-chain active memberships have exact address and version parity."
 }
