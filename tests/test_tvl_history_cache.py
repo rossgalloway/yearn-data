@@ -87,3 +87,26 @@ def test_prepared_histories_keep_chain_identity_and_window_reference_changes(tmp
     cached=TvlDataset(source.manifest)
     assert cached.history(chain_id=10,interval='daily',constant=True,start=DAY+5*86400)==old
     assert all(r['vault']=='10:'+PARENT for r in old['references'])
+
+
+def test_price_only_repair_preserves_old_publication_and_recalculates_deductions(tmp_path):
+    from yearn_data.tvl_history_cache import prepare_price_repair
+    from copy import deepcopy
+    path=tmp_path/'repair.sqlite'
+    with closing(connect(path)) as conn:
+        init_db(conn)
+        run(conn,1,DAY,[(PARENT,'100'),(CHILD,'100')],[(CHILD,'50')])
+        run(conn,2,DAY+86400,[(PARENT,'200'),(CHILD,'200')],[(CHILD,'100')])
+    old=TvlStore(path,tmp_path/'publication').get();prepare(old)
+    manifest=deepcopy(old.manifest);manifest['datasetId']='f'*64
+    manifest['priceRejections'].append({'chainId':1,'asset':'0x'+'aa'*20,'timestamp':DAY,'priceUsd':'10','reason':'verified quote'})
+    repaired=TvlDataset(manifest)
+    result=prepare_price_repair(repaired,old)
+    assert result['recomputedDates']==[DAY]
+    assert old.history(interval='daily')['chart'][0]['Ethereum']==150
+    chart=repaired.history(interval='daily')['chart']
+    assert chart[0].get('Ethereum') is None
+    assert chart[1]['Ethereum']==300
+    assert prepare_price_repair(repaired,old)['status']=='already-prepared'
+    incompatible=deepcopy(manifest);incompatible['datasetId']='e'*64;incompatible['currentBridgePolicy']='retired-registry'
+    with pytest.raises(ValueError,match='preserve all other'):prepare_price_repair(TvlDataset(incompatible),old)
