@@ -92,13 +92,13 @@ def open_db(path: str | Path):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="yearn-data")
-    parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="SQLite path, or neon to use NEON_DB_URL")
+    parser.add_argument("--db", help="SQLite path, neon, or staging; defaults to YEARN_DATA_DB or SQLite")
     parser.add_argument("--env", action="append", default=[], help="Extra .env file to load before defaults")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init-db")
 
-    postgres_p = sub.add_parser('migrate-postgres', help='Stream the shared SQLite history into an empty Neon database')
+    postgres_p = sub.add_parser('migrate-postgres', help='Stream the shared SQLite history into an empty Postgres database')
     postgres_p.add_argument('--source', required=True, type=Path)
     postgres_p.add_argument('--check-only', action='store_true')
     postgres_p.add_argument('--receipt', type=Path, help='Write a credential-free migration receipt')
@@ -155,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--port", type=int, default=3490)
     serve_p.add_argument("--cors-origin", help="Optional production frontend origin")
     serve_p.add_argument("--tvl-publication", type=Path, help="Automatically publish accumulated finished TVL results too")
+    serve_p.add_argument("--published-tvl-only", action="store_true", help="Serve only the updater's selected TVL publication")
     serve_p.add_argument("--current-bridge-policy", choices=["none", "retired-registry"], default="retired-registry")
     serve_p.add_argument("--analytics", action="store_true", help="Serve prepared owned analytics and comparison without legacy services")
     serve_p.add_argument("--comparison-db", type=Path, help="Read-only external DefiLlama reference database")
@@ -310,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result,sort_keys=True))
         return 0 if result["space_sufficient"] else 2
     load_environment(args.env)
+    args.db = args.db or os.environ.get('YEARN_DATA_DB', str(DEFAULT_DB_PATH))
     if args.command == 'collect-analytics':
         from .analytics_collect import collect
         print(json.dumps(collect(args.db), sort_keys=True))
@@ -343,7 +345,8 @@ def main(argv: list[str] | None = None) -> int:
         from .pairing import serve_pairing
         serve_pairing(args.publication, host=args.host, port=args.port, cors_origin=args.cors_origin,
                       tvl_publication=args.tvl_publication, current_bridge_policy=args.current_bridge_policy,
-                      comparison_database=args.comparison_db, analytics=args.analytics)
+                      comparison_database=args.comparison_db, published_tvl_only=args.published_tvl_only,
+                      analytics=args.analytics)
         return 0
     if args.command=='tvl' and args.tvl_command=='prepare-history':
         from .tvl_api import TvlStore
